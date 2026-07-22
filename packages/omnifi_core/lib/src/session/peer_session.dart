@@ -63,6 +63,17 @@ class PeerSession {
   /// between seal and write is fatal to the session.
   Future<void> _outboundTail = Future<void>.value();
 
+  /// Tail of the inbound serialization chain. `Stream.listen` does not await
+  /// an async callback, so without this two frames arriving back to back
+  /// would both be inside [AeadSession.open] at once. Their decryptions can
+  /// finish in either order, and the one that finishes second then fails the
+  /// receive-counter monotonicity check and kills the session — even though
+  /// both frames are legitimate and arrived in wire order.
+  ///
+  /// Deliberately a *separate* chain from [_outboundTail]: a slow inbound
+  /// decrypt must not block sends, and a send must not delay a decrypt.
+  Future<void> _inboundTail = Future<void>.value();
+
   /// Bumped on every [attach]. Frames carrying a stale generation come from
   /// a link the session has already migrated off and are discarded.
   int _generation = 0;
@@ -74,15 +85,36 @@ class PeerSession {
   /// that would poison every later send.
   Future<T> _serialized<T>(Future<T> Function() action) {
     final completer = Completer<T>();
-    _outboundTail = _outboundTail.then((_) async {
-      try {
-        completer.complete(await action());
-      } catch (e, st) {
-        completer.completeError(e, st);
-      }
-    });
+    _outboundTail = _chain(_outboundTail, action, completer);
     return completer.future;
   }
+
+  /// Runs [action] after every previously queued inbound action, so at most
+  /// one frame is being decrypted and delivered at a time.
+  ///
+  /// Same non-latching contract as [_serialized]: failures land on the
+  /// per-call completer, never on [_inboundTail], so one bad frame cannot
+  /// block every frame that follows it.
+  Future<T> _serializedInbound<T>(Future<T> Function() action) {
+    final completer = Completer<T>();
+    _inboundTail = _chain(_inboundTail, action, completer);
+    return completer.future;
+  }
+
+  /// Appends [action] to [tail], funnelling both success and failure into
+  /// [completer] so the returned tail is always a *resolved* future.
+  static Future<void> _chain<T>(
+    Future<void> tail,
+    Future<T> Function() action,
+    Completer<T> completer,
+  ) =>
+      tail.then((_) async {
+        try {
+          completer.complete(await action());
+        } catch (e, st) {
+          completer.completeError(e, st);
+        }
+      });
 
   Link? get link => _link;
   Stream<Envelope> get inbound => _inbound.stream;
@@ -259,7 +291,15 @@ class PeerSession {
     }
   }
 
-  Future<void> _onFrame(Uint8List frame, int generation) async {
+  /// Entry point for the link's inbound listener.
+  ///
+  /// The whole handling of one frame runs under the inbound lock, so the
+  /// next frame does not enter [AeadSession.open] until this one has been
+  /// opened and delivered.
+  Future<void> _onFrame(Uint8List frame, int generation) =>
+      _serializedInbound(() => _onFrameLocked(frame, generation));
+
+  Future<void> _onFrameLocked(Uint8List frame, int generation) async {
     if (_isStale(generation)) return;
     final Uint8List plaintext;
     try {

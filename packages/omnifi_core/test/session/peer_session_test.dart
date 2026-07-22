@@ -180,6 +180,43 @@ class _LaggyCancelSubscription<T> implements StreamSubscription<T> {
   Future<E> asFuture<E>([E? futureValue]) => _inner.asFuture<E>(futureValue);
 }
 
+/// An [AeadSession] whose decryptions can be made to finish in an order
+/// other than the order they were started in.
+///
+/// It reproduces the real structure of [AeadSession.open]: a monotonicity
+/// check, then a suspension for the decryption, then the commit. The check
+/// below is the pre-decrypt one; the check inside `super.open`, reached only
+/// after the injected delay, then plays the part of the post-await re-check.
+/// So two frames really are inside `open()` at the same time, exactly as
+/// they are when `Stream.listen` fires an async handler twice back to back.
+class OutOfOrderOpenSession extends AeadSession {
+  OutOfOrderOpenSession({
+    required super.sendKey,
+    required super.receiveKey,
+    required this.openDelays,
+  });
+
+  /// Decryption durations, by call index. Later entries may be shorter than
+  /// earlier ones, which is the whole point.
+  final List<Duration> openDelays;
+  int openCount = 0;
+
+  @override
+  Future<Uint8List> open(List<int> sealed, {List<int> aad = const []}) async {
+    final index = openCount++;
+    final bytes = Uint8List.fromList(sealed);
+    final counter =
+        ByteData.view(bytes.buffer, bytes.offsetInBytes).getUint64(0);
+    if (counter <= lastAcceptedReceiveCounter) {
+      throw ReplayError(counter, lastAcceptedReceiveCounter);
+    }
+    await Future<void>.delayed(
+      index < openDelays.length ? openDelays[index] : Duration.zero,
+    );
+    return super.open(bytes, aad: aad);
+  }
+}
+
 /// Seals an envelope as device `a` would, without going through a session,
 /// so tests can inject a frame at an exact moment.
 Future<Uint8List> sealAsPeerA(AeadSession sender, MessageType type) async {
@@ -506,7 +543,12 @@ void main() {
     // migrates: the microtask that starts decryption has already run, so
     // AeadSession.open is genuinely suspended mid-decrypt when attach(B)
     // bumps the generation.
+    // (Inbound handling is serialized, so the handler body starts one
+    // microtask after the listener fires rather than synchronously with it;
+    // pump until AeadSession.open is genuinely suspended.)
     first.b.deliver(inFlightFrame);
+    await null;
+    await null;
     await null;
     final second = DelayedLink.pair();
     s.b.attach(second.b);
@@ -747,6 +789,54 @@ void main() {
     expect(links.a.sent, isEmpty);
     expect(seen, isEmpty);
     expect(s.a.queuedFrameCount, 1);
+  });
+
+  test('frames whose decryptions finish out of order are all delivered',
+      () async {
+    // Sender side: a plain session, so the two frames carry counters 0 and 1
+    // in wire order.
+    final sender = AeadSession(sendKey: _aSendKey, receiveKey: _aReceiveKey);
+    Future<Uint8List> seal(int i) => sender.seal(encodeEnvelope(Envelope(
+          version: omnifiProtocolVersion,
+          type: MessageType.clipboardUpdate,
+          senderDeviceId: 'a' * 32,
+          messageId: randomHexId(),
+          timestampMs: fixedClock(),
+          payload: {'i': i},
+        )));
+    final first = await seal(0);
+    final second = await seal(1);
+
+    // Receiver side: the second frame's decryption finishes well before the
+    // first one's.
+    final receiver = PeerSession(
+      localDeviceId: 'b' * 32,
+      peerDeviceId: 'a' * 32,
+      crypto: OutOfOrderOpenSession(
+        sendKey: _aReceiveKey,
+        receiveKey: _aSendKey,
+        openDelays: const [
+          Duration(milliseconds: 60),
+          Duration(milliseconds: 1),
+        ],
+      ),
+      clock: fixedClock,
+    );
+    final link = DelayedLink('out-of-order');
+    receiver.attach(link);
+    final seen = <Envelope>[];
+    receiver.inbound.listen(seen.add);
+    final errors = <Object>[];
+    receiver.errors.listen(errors.add);
+
+    // Back to back, with no chance for the first handler to finish first.
+    link.deliver(first);
+    link.deliver(second);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(errors, isEmpty);
+    expect(receiver.isDead, isFalse);
+    expect(seen.map((e) => e.payload['i']).toList(), [0, 1]);
   });
 
   test('a stale link stream error is not emitted after migration', () async {
