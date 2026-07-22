@@ -1,0 +1,151 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:cryptography/cryptography.dart';
+
+import '../protocol/envelope.dart';
+import '../protocol/messages.dart';
+import '../session/peer_session.dart';
+import 'clipboard_watcher.dart';
+
+const int maxClipboardBytes = 1048576;
+
+const String _clipboardCollapseKey = 'clipboard';
+
+String clipboardHash(String format, List<int> data) {
+  final digest =
+      Sha256().toSync().hashSync([...utf8.encode(format), 0, ...data]);
+  return digest.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}
+
+/// Bridges the platform clipboard to peer sessions.
+class ClipboardSync {
+  ClipboardSync({
+    required ClipboardWatcher watcher,
+    required List<PeerSession> Function() peers,
+    required int Function() clock,
+  })  : _watcher = watcher,
+        _peers = peers,
+        _clock = clock;
+
+  final ClipboardWatcher _watcher;
+  final List<PeerSession> Function() _peers;
+  final int Function() _clock;
+
+  StreamSubscription<ClipboardContent>? _sub;
+  String? _lastAppliedHash;
+  int _lastAppliedTimestampMs = 0;
+  bool _userPaused = false;
+  bool _lockPaused = false;
+  int _skippedConcealedCount = 0;
+  int _skippedOversizedCount = 0;
+
+  String? get lastAppliedHash => _lastAppliedHash;
+  bool get isPaused => _userPaused || _lockPaused;
+  int get skippedConcealedCount => _skippedConcealedCount;
+  int get skippedOversizedCount => _skippedOversizedCount;
+
+  Future<void> start() async {
+    await _watcher.start();
+    _sub = _watcher.changes.listen(_onLocalChange);
+  }
+
+  Future<void> stop() async {
+    await _sub?.cancel();
+    await _watcher.stop();
+  }
+
+  void setPaused(bool paused) => _userPaused = paused;
+
+  void onScreenLocked() => _lockPaused = true;
+
+  /// Clears only the lock-induced pause. A deliberate user pause survives.
+  void onScreenUnlocked() => _lockPaused = false;
+
+  Future<void> _onLocalChange(ClipboardContent content) async {
+    if (isPaused) return;
+
+    if (content.isConcealed) {
+      _skippedConcealedCount++;
+      return;
+    }
+
+    final hash = clipboardHash(content.format, content.data);
+    if (hash == _lastAppliedHash) {
+      // Our own write echoing back through the platform watcher. Dropping
+      // this is what stops two machines ping-ponging forever.
+      return;
+    }
+
+    final now = _clock();
+
+    if (content.data.length > maxClipboardBytes) {
+      _skippedOversizedCount++;
+      await _broadcast(MessageType.clipboardTooLarge, {
+        'format': content.format,
+        'bytes': content.data.length,
+        'limit': maxClipboardBytes,
+      });
+      return;
+    }
+
+    _lastAppliedHash = hash;
+    _lastAppliedTimestampMs = now;
+
+    await _broadcast(
+      MessageType.clipboardUpdate,
+      ClipboardPayload(
+        format: content.format,
+        data: content.data,
+        timestampMs: now,
+        contentHash: hash,
+      ).toMap(),
+      collapseKey: _clipboardCollapseKey,
+    );
+  }
+
+  Future<void> _broadcast(
+    MessageType type,
+    Map<String, Object?> payload, {
+    String? collapseKey,
+  }) async {
+    for (final peer in _peers()) {
+      if (peer.isDead) continue;
+      try {
+        await peer.send(type, payload, collapseKey: collapseKey);
+      } on SessionRejectedError {
+        // A dead session is the LinkManager's problem, not ours; skip it
+        // rather than aborting delivery to healthy peers.
+        continue;
+      }
+    }
+  }
+
+  Future<void> handleIncoming(Envelope envelope) async {
+    if (envelope.type != MessageType.clipboardUpdate) return;
+
+    final ClipboardPayload payload;
+    try {
+      payload = ClipboardPayload.fromMap(envelope.payload);
+    } on EnvelopeError {
+      return;
+    }
+
+    if (payload.timestampMs < _lastAppliedTimestampMs) {
+      // Last-write-wins by wall clock. A clipboard has no history to
+      // corrupt, so the loser simply loses.
+      return;
+    }
+    if (payload.data.length > maxClipboardBytes) return;
+
+    _lastAppliedHash = payload.contentHash;
+    _lastAppliedTimestampMs = payload.timestampMs;
+
+    await _watcher.write(ClipboardContent(
+      format: payload.format,
+      data: Uint8List.fromList(payload.data),
+      isConcealed: false,
+    ));
+  }
+}

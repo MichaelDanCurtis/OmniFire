@@ -18,3 +18,5 @@ export 'src/transport/link_manager.dart';
 export 'src/session/peer_session.dart';
 export 'src/pairing/pairing_payload.dart';
 export 'src/pairing/pairing_flow.dart';
+export 'src/sync/clipboard_sync.dart';
+export 'src/sync/clipboard_watcher.dart';
