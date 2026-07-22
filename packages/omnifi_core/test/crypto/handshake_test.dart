@@ -177,9 +177,37 @@ void main() {
 
   test('start() twice on one instance throws', () async {
     final ik = await OmniFiHandshakeV1.generateStaticKeys();
-    final hs = OmniFiHandshakeV1.initiator(staticKeys: ik, deviceId: 'aaaa');
+    final rk = await OmniFiHandshakeV1.generateStaticKeys();
+    final hs = OmniFiHandshakeV1.initiator(
+      staticKeys: ik,
+      deviceId: 'aaaa',
+      expectedPeerStaticPublicKey: rk.publicKey,
+    );
     await hs.start();
     expect(hs.start(), throwsA(isA<HandshakeError>()));
+  });
+
+  test(
+      'constructing a Handshake with neither an expected peer key nor a psk '
+      'throws', () async {
+    final ik = await OmniFiHandshakeV1.generateStaticKeys();
+    expect(
+      () => OmniFiHandshakeV1.initiator(
+        staticKeys: ik,
+        deviceId: 'aaaa',
+        expectedPeerStaticPublicKey: null,
+      ),
+      throwsA(isA<HandshakeError>()),
+    );
+    expect(
+      () => OmniFiHandshakeV1.responder(
+        staticKeys: ik,
+        deviceId: 'aaaa',
+        expectedPeerStaticPublicKey: null,
+        psk: const [],
+      ),
+      throwsA(isA<HandshakeError>()),
+    );
   });
 
   test('complete() with a different peer message than confirmationFor() throws',
@@ -187,20 +215,41 @@ void main() {
     final ik = await OmniFiHandshakeV1.generateStaticKeys();
     final rk = await OmniFiHandshakeV1.generateStaticKeys();
     final other = OmniFiHandshakeV1.responder(
-        staticKeys: rk, deviceId: 'cccc');
+      staticKeys: rk,
+      deviceId: 'cccc',
+      expectedPeerStaticPublicKey: null,
+      psk: List<int>.filled(32, 1),
+    );
     final otherMessage = await other.start();
 
     final initiator = OmniFiHandshakeV1.initiator(
-        staticKeys: ik, deviceId: 'aaaa');
+      staticKeys: ik,
+      deviceId: 'aaaa',
+      expectedPeerStaticPublicKey: rk.publicKey,
+    );
     final responder = OmniFiHandshakeV1.responder(
-        staticKeys: rk, deviceId: 'bbbb');
+      staticKeys: rk,
+      deviceId: 'bbbb',
+      expectedPeerStaticPublicKey: ik.publicKey,
+    );
     final m1 = await initiator.start();
     final m2 = await responder.start();
     final rc = await responder.confirmationFor(m1);
     await initiator.confirmationFor(m2);
 
-    expect(initiator.complete(otherMessage, rc),
-        throwsA(isA<HandshakeError>()));
+    Object? caught;
+    try {
+      await initiator.complete(otherMessage, rc);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught, isA<HandshakeError>());
+    expect(
+      (caught as HandshakeError).reason.toLowerCase(),
+      contains('already derived'),
+      reason: 'must name the memoisation-cache mismatch, not an incidental '
+          'AEAD failure from re-deriving against a different transcript',
+    );
   });
 
   test('malformed peer messages are rejected', () async {
@@ -250,7 +299,11 @@ void main() {
     };
 
     for (final entry in cases.entries) {
-      final hs = OmniFiHandshakeV1.initiator(staticKeys: ik, deviceId: 'aaaa');
+      final hs = OmniFiHandshakeV1.initiator(
+        staticKeys: ik,
+        deviceId: 'aaaa',
+        expectedPeerStaticPublicKey: peer.publicKey,
+      );
       await hs.start();
       expect(
         hs.confirmationFor(entry.value),

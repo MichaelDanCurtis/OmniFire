@@ -84,12 +84,24 @@ class OmniFiHandshakeV1 implements Handshake {
     required this.isInitiator,
     required this.expectedPeerStaticPublicKey,
     required this.psk,
-  });
+  }) {
+    // A Handshake with neither an expected peer static key nor a pre-shared
+    // key authenticates nobody: it neither checks the peer against a known
+    // identity (the post-pairing case) nor mixes in a shared secret (the
+    // pairing case). That combination is never legitimate, so refuse it here
+    // rather than silently producing a working-but-unauthenticated session.
+    if (expectedPeerStaticPublicKey == null && psk.isEmpty) {
+      throw const HandshakeError(
+          'no authentication mechanism configured: expectedPeerStaticPublicKey '
+          'is null and psk is empty; supply a known peer static key '
+          '(post-pairing) or a non-empty psk (pairing), not neither');
+    }
+  }
 
   factory OmniFiHandshakeV1.initiator({
     required StaticKeyPair staticKeys,
     required String deviceId,
-    List<int>? expectedPeerStaticPublicKey,
+    required List<int>? expectedPeerStaticPublicKey,
     List<int> psk = const [],
   }) =>
       OmniFiHandshakeV1._(
@@ -103,7 +115,7 @@ class OmniFiHandshakeV1 implements Handshake {
   factory OmniFiHandshakeV1.responder({
     required StaticKeyPair staticKeys,
     required String deviceId,
-    List<int>? expectedPeerStaticPublicKey,
+    required List<int>? expectedPeerStaticPublicKey,
     List<int> psk = const [],
   }) =>
       OmniFiHandshakeV1._(
@@ -293,6 +305,16 @@ class OmniFiHandshakeV1 implements Handshake {
     );
     final masterBytes = await master.extractBytes();
 
+    // `package:cryptography`'s Hkdf.deriveKey is full HKDF Extract-then-Expand
+    // (RFC 5869), not the bare HKDF-Expand the design doc's normative text
+    // describes — passing `nonce: const []` selects an empty salt for
+    // Extract, it does not skip Extract. This is deliberate and does not
+    // weaken anything: domain separation between the four keys derived here
+    // comes entirely from the four distinct `info` labels, and an empty salt
+    // is a valid HKDF salt (RFC 5869 treats a missing salt as a zero string).
+    // Do not "fix" this to a literal HKDF-Expand-only call — that would
+    // change every derived key and break interop with anything that already
+    // speaks this wire format.
     Future<List<int>> expand(String label) async {
       final k = await _hkdf.deriveKey(
         secretKey: SecretKey(masterBytes),
