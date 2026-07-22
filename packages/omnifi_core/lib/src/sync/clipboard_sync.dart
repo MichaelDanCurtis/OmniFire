@@ -139,7 +139,17 @@ class ClipboardSync {
     }
     if (payload.data.length > maxClipboardBytes) return;
 
-    _lastAppliedHash = payload.contentHash;
+    // Recompute rather than trust the peer's `contentHash`. This is the
+    // value the echo check compares against once the platform watcher fires
+    // for our own write; if it came from the peer instead of from what we
+    // actually applied, a peer that sends a hash mismatched with its own
+    // data (bug, version skew, or deliberately) desyncs the check and the
+    // echo is never suppressed, causing an unbounded ping-pong between the
+    // two devices. Recomputing is self-validating and costs one hash of
+    // content already in memory. Deliberately not also rejecting payloads
+    // whose declared contentHash disagrees with their data -- that is a
+    // separate integrity-strictness decision and out of scope here.
+    _lastAppliedHash = clipboardHash(payload.format, payload.data);
     _lastAppliedTimestampMs = payload.timestampMs;
 
     await _watcher.write(ClipboardContent(

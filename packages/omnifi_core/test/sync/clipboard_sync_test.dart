@@ -116,6 +116,44 @@ void main() {
     expect(broadcasts, 0);
   });
 
+  test(
+      'does not echo applied content even when the peer sent a mismatched '
+      'contentHash', () async {
+    final s = linkedSessions();
+    final watcher = FakeClipboardWatcher();
+    final sync = ClipboardSync(
+      watcher: watcher, peers: () => [s.local], clock: testClock);
+    await sync.start();
+
+    final incoming = text('round trip, wrong hash');
+    await sync.handleIncoming(Envelope(
+      version: omnifiProtocolVersion,
+      type: MessageType.clipboardUpdate,
+      senderDeviceId: 'b' * 32,
+      messageId: 'm' * 32,
+      timestampMs: _now,
+      payload: ClipboardPayload(
+        format: 'text',
+        data: incoming.data,
+        timestampMs: _now,
+        // Deliberately wrong: does not match the hash of `incoming.data`.
+        // A buggy or malicious peer could send this; the receiver must not
+        // trust it, since it is the mechanism that suppresses our own
+        // write echoing back through the platform watcher.
+        contentHash: clipboardHash('text', utf8.encode('not the real body')),
+      ).toMap(),
+    ));
+
+    // The platform watcher now fires for our own write of the applied
+    // content. Loop prevention must key off what was actually applied, not
+    // the peer-declared hash, or this echoes straight back to the peer.
+    var broadcasts = 0;
+    s.remote.inbound.listen((_) => broadcasts++);
+    watcher.emit(incoming);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(broadcasts, 0);
+  });
+
   test('a genuinely new copy after an applied one still broadcasts',
       () async {
     final s = linkedSessions();
