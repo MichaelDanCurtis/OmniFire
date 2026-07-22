@@ -4919,7 +4919,9 @@ git commit -m "feat: add clipboard sync with loop prevention and privacy default
   - `GET /v1/mesh/:meshId/ws?device=:deviceId` with `Upgrade: websocket` — joins the mesh.
   - Frames sent by a client are binary. The first 16 bytes are the **destination device ID** as raw bytes (32 hex chars decoded), or 16 zero bytes for broadcast. The remainder is opaque ciphertext, forwarded verbatim.
   - `GET /v1/health` → `200 {"ok":true}`.
-  - Server closes with code `1008` on a malformed mesh ID or device ID, `1009` on a frame over 1 MiB.
+  - Server returns HTTP `400` **before completing the upgrade** on a malformed mesh ID or device ID, and HTTP `426` on a non-upgrade request to the ws path. Once a socket exists, an oversized frame (over 1 MiB) closes it with code `1009`.
+
+    A close code cannot be used for a malformed ID: those are detected before the WebSocket handshake completes, so no socket exists to close. Emitting one would mean accepting the upgrade purely to close it immediately — an extra round trip and a harder error for the client to surface. `1009` is a close code because by the time a frame is read, the socket is live. Task 19's `RelayLink` must therefore treat a non-101 response as a connect failure, not as a close event.
 
 - [ ] **Step 1: Create the project files**
 
