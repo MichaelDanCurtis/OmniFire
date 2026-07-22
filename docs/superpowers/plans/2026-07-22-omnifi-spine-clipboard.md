@@ -2836,22 +2836,39 @@ class Outbox {
         _entries
           ..clear()
           ..addAll(existing);
-        _enforceBounds();
+        _enforceBounds(protect: entry);
         return;
       }
     }
 
     _entries.addLast(entry);
     _byteLength += entry.frame.length;
-    _enforceBounds();
+    _enforceBounds(protect: entry);
   }
 
-  void _enforceBounds() {
+  /// Evicts oldest-first until both bounds hold, never evicting [protect].
+  ///
+  /// [protect] is the entry this call just added or collapsed into. Without
+  /// that exemption a large collapsed replacement — which keeps its ORIGINAL
+  /// queue position, often near the front — gets evicted by its own insertion
+  /// while older unrelated frames survive. For a clipboard queue that inverts
+  /// the point of collapsing: the freshest content is what disappears.
+  ///
+  /// Termination is guaranteed because [add] rejects any single frame larger
+  /// than the whole byte budget, so the protected entry alone always fits.
+  void _enforceBounds({OutboxEntry? protect}) {
     while (_entries.length > maxOutboxFrames ||
         _byteLength > maxOutboxBytes) {
-      final dropped = _entries.removeFirst();
+      final victimIndex =
+          _entries.toList().indexWhere((e) => !identical(e, protect));
+      if (victimIndex < 0) break;
+      final remaining = _entries.toList()..removeAt(victimIndex);
+      final dropped = _entries.toList()[victimIndex];
       _byteLength -= dropped.frame.length;
       _droppedCount++;
+      _entries
+        ..clear()
+        ..addAll(remaining);
     }
   }
 
