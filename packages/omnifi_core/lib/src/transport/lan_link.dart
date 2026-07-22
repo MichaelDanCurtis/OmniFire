@@ -109,8 +109,21 @@ class LanLink implements Link {
     if (_state != LinkState.connected) {
       throw LinkClosedError(id);
     }
-    _socket.add(encodeFrame(frame));
-    await _socket.flush();
+    try {
+      _socket.add(encodeFrame(frame));
+      await _socket.flush();
+    } on SocketException {
+      // Per dart:io IOSink semantics, a write failure on a half-closed or
+      // reset socket is not thrown synchronously from add() -- it surfaces
+      // here, on the following flush(). Callers such as pairing_flow.dart
+      // depend on LinkClosedError specifically (not a raw transport
+      // exception) to tell "the link died mid-exchange" apart from a real
+      // internal fault, so this must be converted rather than left to
+      // propagate. The link is also terminal now: mark it failed so
+      // LinkManager stops treating it as a candidate.
+      _setState(LinkState.failed);
+      throw LinkClosedError(id);
+    }
   }
 
   @override
@@ -134,9 +147,32 @@ class LanListener {
     _sub = _server.listen((socket) async {
       socket.setOption(SocketOption.tcpNoDelay, true);
       // The peer's identity is established by the session handshake, not by
-      // the socket, so a provisional id is fine here.
-      _incoming.add(await LanLink.fromSocket(socket,
-          peerDeviceId: 'pending-${socket.remotePort}'));
+      // the socket, so a provisional id is fine here -- but it must still be
+      // collision-resistant: two different peers dialing this listener
+      // concurrently can independently pick the same ephemeral source port
+      // (ephemeral ranges overlap across operating systems and the clients
+      // do not coordinate), so the port alone is not enough. The remote
+      // address is included too: two peers can share a port, but not both
+      // the port and the address. LinkManager keys its candidate map
+      // directly by link id with no collision check, so an id collision
+      // would silently overwrite one candidate and leak its socket.
+      final link = await LanLink.fromSocket(
+        socket,
+        peerDeviceId:
+            'pending-${socket.remoteAddress.address}-${socket.remotePort}',
+      );
+      if (_closed) {
+        // close() ran while this callback was suspended at the await
+        // above: cancelling a subscription does not retract an event
+        // already dispatched into a suspended async callback, so this
+        // connection can still resume after _incoming was closed. Adding
+        // to a closed StreamController throws StateError, and dropping the
+        // link here without closing it would leak its socket -- neither
+        // caller nor any listener is coming for it now, so dispose of it.
+        await link.close();
+        return;
+      }
+      _incoming.add(link);
     });
   }
 
@@ -153,12 +189,18 @@ class LanListener {
   final StreamController<LanLink> _incoming =
       StreamController<LanLink>.broadcast();
   StreamSubscription<Socket>? _sub;
+  bool _closed = false;
 
   int get port => _server.port;
   String get localDeviceId => _localDeviceId;
   Stream<LanLink> get incoming => _incoming.stream;
 
   Future<void> close() async {
+    // Set before any await: an accept callback already suspended at the
+    // `await LanLink.fromSocket(...)` above resumes on a later microtask no
+    // matter what we do to the subscription below, and must see this flag
+    // updated by then.
+    _closed = true;
     await _sub?.cancel();
     await _server.close();
     if (!_incoming.isClosed) await _incoming.close();
