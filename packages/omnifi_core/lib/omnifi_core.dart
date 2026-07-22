@@ -19,6 +19,7 @@ export 'src/transport/outbox.dart';
 export 'src/transport/link_manager.dart';
 export 'src/transport/fake_link_factory.dart';
 export 'src/session/peer_session.dart';
+export 'src/session/session_establisher.dart';
 export 'src/pairing/pairing_payload.dart';
 export 'src/pairing/pairing_flow.dart';
 export 'src/sync/clipboard_sync.dart';

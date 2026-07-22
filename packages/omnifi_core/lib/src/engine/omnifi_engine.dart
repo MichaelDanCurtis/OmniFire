@@ -8,6 +8,7 @@ import '../pairing/pairing_flow.dart';
 import '../pairing/pairing_payload.dart';
 import '../protocol/envelope.dart';
 import '../session/peer_session.dart';
+import '../session/session_establisher.dart';
 import '../sync/clipboard_sync.dart';
 import '../sync/clipboard_watcher.dart';
 import '../transport/lan_link.dart';
@@ -89,6 +90,9 @@ class OmniFiEngine {
   final Map<String, PeerSession> _sessions = {};
   final Map<String, LinkManager> _managers = {};
   final Map<String, ConnectionStatus> _peerStatuses = {};
+
+  /// Tail of the per-peer link-adoption chain. See [_adoptLink].
+  final Map<String, Future<void>> _adoptTails = {};
   final StreamController<ConnectionStatus> _statuses =
       StreamController<ConnectionStatus>.broadcast();
   final List<StreamSubscription<Object?>> _subs = [];
@@ -98,6 +102,12 @@ class OmniFiEngine {
 
   LanListener? _listener;
   bool _started = false;
+
+  /// Set by [stop] and cleared by [start]. A handshake in flight when the
+  /// engine is torn down completes after [stop] has already snapshotted and
+  /// cleared [_sessions]; without this it would install a session nothing
+  /// tracks and nothing disposes.
+  bool _shutdown = false;
 
   List<PeerSession> get sessions => _sessions.values.toList();
   Stream<ConnectionStatus> get statuses => _statuses.stream;
@@ -127,6 +137,7 @@ class OmniFiEngine {
   Future<void> start() async {
     if (_started) return;
     _started = true;
+    _shutdown = false;
     await clipboard.start();
 
     if (config.lanEnabled) {
@@ -180,26 +191,12 @@ class OmniFiEngine {
       );
 
   Future<void> _connectPeer(PeerRecord peer) async {
-    // A real session requires a handshake over a link; the manager dials,
-    // and the handshake runs on first connect. Sessions created here start
-    // detached and become live when a link is adopted.
-    final session = _sessions.putIfAbsent(
-      peer.deviceId,
-      () => PeerSession(
-        localDeviceId: identity.deviceId,
-        peerDeviceId: peer.deviceId,
-        crypto: AeadSession(
-          sendKey: List<int>.filled(32, 0),
-          receiveKey: List<int>.filled(32, 0),
-        ),
-        clock: _clock,
-      ),
-    );
-
-    _subs.add(_listenInbound(session));
-
+    // No PeerSession is created here. A session's keys come from a handshake,
+    // the handshake needs a link, and the manager below is what produces
+    // links, so the session is created by [_adoptLink] the first time one of
+    // these dialers connects. (It used to be created here with all-zero AEAD
+    // keys, deferring to a handshake nothing performed.)
     final manager = LinkManager(
-      session: session,
       clock: _clock,
       // One dialer per configured relay backend. Two relays are two
       // candidate links, not a primary plus a failover path: LinkManager
@@ -207,11 +204,14 @@ class OmniFiEngine {
       // other by measured RTT. Adding a backend costs one list entry.
       dialers: [
         for (final relayBase in config.relayBases)
-          () => RelayLink.connect(
-                relayBase: relayBase,
-                meshId: mesh.meshId,
-                localDeviceId: identity.deviceId,
-                peerDeviceId: peer.deviceId,
+          () => _dialAndEstablish(
+                peer,
+                () => RelayLink.connect(
+                      relayBase: relayBase,
+                      meshId: mesh.meshId,
+                      localDeviceId: identity.deviceId,
+                      peerDeviceId: peer.deviceId,
+                    ),
               ),
       ],
     );
@@ -222,6 +222,95 @@ class OmniFiEngine {
     }));
     _peerStatuses[peer.deviceId] = manager.status;
     await manager.start();
+  }
+
+  /// Dials, then establishes a session before the link is handed back to
+  /// [LinkManager] to be offered as a candidate.
+  ///
+  /// Establishment failure propagates out of the dialer deliberately. The
+  /// link never becomes a candidate — a peer that fails the handshake is not
+  /// who the roster says it is — and LinkManager sees a *failed* dial, so a
+  /// handshake that never succeeds grows the backoff instead of being counted
+  /// as a healthy connection that simply carries nothing.
+  Future<Link> _dialAndEstablish(
+    PeerRecord peer,
+    Future<Link> Function() dial,
+  ) async {
+    final link = await dial();
+    await _adoptLink(peer, link);
+    return link;
+  }
+
+  /// Returns the live session for [peer], establishing one over [link] first
+  /// if there is not already one, and attaches it to [link].
+  ///
+  /// Serialized per peer. Two dialers can return links in the same turn of the
+  /// event loop; without this, both would read [_sessions] before either
+  /// wrote it, both would run a handshake, and the second write would strand
+  /// the first session — whose peer has already discarded its half — inside
+  /// whatever the manager had attached it to.
+  Future<PeerSession> _adoptLink(PeerRecord peer, Link link) {
+    final completer = Completer<PeerSession>();
+    final tail = _adoptTails[peer.deviceId] ?? Future<void>.value();
+    // Same non-latching contract as PeerSession's chains: failures land on
+    // the per-call completer, never on the tail, so one failed handshake
+    // cannot block every later adoption for this peer.
+    _adoptTails[peer.deviceId] = tail.then((_) async {
+      try {
+        completer.complete(await _adoptLinkLocked(peer, link));
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+    return completer.future;
+  }
+
+  Future<PeerSession> _adoptLinkLocked(PeerRecord peer, Link link) async {
+    // One handshake per *session*, not per link: a PeerSession is keyed to
+    // the device pair and migrates across links without renegotiating crypto.
+    // Only a dead session is replaced — a decryption failure forces a fresh
+    // handshake rather than a counter resync, so its keys can never be
+    // reconciled with the peer's.
+    final live = _sessions[peer.deviceId];
+    if (live != null && !live.isDead) return live;
+
+    final crypto = await SessionEstablisher.establish(
+      link: link,
+      identity: identity,
+      peer: peer,
+    );
+
+    // Re-read across the suspension rather than reusing `live`: the handshake
+    // is a network round trip, and forgetPeer() or stop() can have retired
+    // this peer while it was in flight. Installing a session then would
+    // resurrect a peer the user just removed, or leave one behind that the
+    // teardown's snapshot will never dispose.
+    if (_shutdown || mesh.peer(peer.deviceId) == null) {
+      try {
+        await link.close();
+      } on Object {
+        // Best effort: the link is being abandoned either way.
+      }
+      throw SessionEstablishmentError(
+          'peer ${peer.deviceId} is no longer connected by this engine');
+    }
+    final stale = _sessions.remove(peer.deviceId);
+    await stale?.dispose();
+
+    final session = PeerSession(
+      localDeviceId: identity.deviceId,
+      peerDeviceId: peer.deviceId,
+      crypto: crypto,
+      clock: _clock,
+    );
+    _sessions[peer.deviceId] = session;
+    _subs.add(_listenInbound(session));
+    // The manager may already be attached to a *different*, better-ranked
+    // link, in which case its own _selectBest would not attach this fresh
+    // session to anything. Point it at the link the handshake just ran over.
+    _managers[peer.deviceId]?.session = session;
+    session.attach(link);
+    return session;
   }
 
   Future<PairingSasPending> beginInvite(Link link) => PairingFlow.invite(
@@ -242,6 +331,10 @@ class OmniFiEngine {
     await persist();
     await _managers.remove(deviceId)?.stop();
     await _sessions.remove(deviceId)?.dispose();
+    // Dropped, not awaited: a handshake still in flight for this peer would
+    // hold the teardown for its full timeout, and it refuses to install
+    // anything anyway once the roster entry is gone.
+    unawaited(_adoptTails.remove(deviceId) ?? Future<void>.value());
     _peerStatuses.remove(deviceId);
     _statuses.add(status);
   }
@@ -257,6 +350,9 @@ class OmniFiEngine {
 
   Future<void> stop() async {
     _started = false;
+    // Before the first suspension point, so a handshake already in flight
+    // cannot install its session in the window this teardown is suspended in.
+    _shutdown = true;
     // Snapshot and clear synchronously, before the first suspension point.
     // Iterating these collections across an `await` would let a concurrent
     // _connectPeer() (a start() still in flight, or a peer added while the
@@ -269,6 +365,7 @@ class OmniFiEngine {
     _subs.clear();
     _managers.clear();
     _sessions.clear();
+    _adoptTails.clear();
     _peerStatuses.clear();
     final listener = _listener;
     _listener = null;
@@ -296,6 +393,11 @@ class OmniFiEngine {
   void debugSetPeerStatus(String deviceId, ConnectionStatus status) {
     _peerStatuses[deviceId] = status;
   }
+
+  /// Runs the adoption path a dialer would run: establishes a session for
+  /// [peer] over [link] unless a live one already exists, then attaches.
+  Future<PeerSession> debugAdoptLink(PeerRecord peer, Link link) =>
+      _adoptLink(peer, link);
 
   PeerSession debugAttachSession({
     required String peerDeviceId,

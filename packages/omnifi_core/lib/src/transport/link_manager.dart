@@ -43,7 +43,7 @@ class BackoffPolicy {
 /// best-ranked one, fails over on disconnect, and redials with backoff.
 class LinkManager {
   LinkManager({
-    required this.session,
+    PeerSession? session,
     required List<Future<Link> Function()> dialers,
     required int Function() clock,
     BackoffPolicy? backoff,
@@ -51,9 +51,23 @@ class LinkManager {
     this.livenessTimeout = const Duration(seconds: 45),
   })  : _dialers = dialers,
         _clock = clock,
-        _backoff = backoff ?? BackoffPolicy();
+        _backoff = backoff ?? BackoffPolicy() {
+    if (session != null) this.session = session;
+  }
 
-  final PeerSession session;
+  /// The session adopted links are attached to.
+  ///
+  /// Late-bound rather than required, because a real session's keys come from
+  /// a handshake, the handshake needs a link, and this manager is what
+  /// produces links. The engine therefore constructs the manager without a
+  /// session and assigns one from inside its dialer, strictly before that
+  /// dialer returns a link — and [offer] is the only path that reads it, so
+  /// no read can precede the assignment.
+  ///
+  /// Reassignable for the same reason it is late: a decryption failure kills
+  /// a session permanently, and the replacement must be installed without
+  /// tearing down the manager that owns the connection to that peer.
+  late PeerSession session;
   final List<Future<Link> Function()> _dialers;
   final int Function() _clock;
   final BackoffPolicy _backoff;
