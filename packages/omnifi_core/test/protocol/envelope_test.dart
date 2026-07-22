@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:cbor/cbor.dart';
 import 'package:omnifi_core/omnifi_core.dart';
 import 'package:test/test.dart';
 
@@ -12,6 +13,20 @@ Envelope sample({MessageType type = MessageType.clipboardUpdate}) => Envelope(
       timestampMs: 1753200000000,
       payload: {'k': 'v'},
     );
+
+/// Builds raw envelope bytes with a hand-crafted `p` (payload) CBOR value,
+/// bypassing [encodeEnvelope] so tests can smuggle in payload shapes that
+/// [Envelope] itself could never produce (e.g. non-string map keys).
+Uint8List encodeEnvelopeWithRawPayload(CborValue rawPayload) {
+  return Uint8List.fromList(cbor.encode(CborValue({
+    'v': omnifiProtocolVersion,
+    't': MessageType.clipboardUpdate.wireName,
+    'from': 'a' * 32,
+    'mid': 'b' * 32,
+    'ts': 1,
+    'p': rawPayload,
+  })));
+}
 
 void main() {
   test('round-trips an envelope', () {
@@ -50,8 +65,38 @@ void main() {
         throwsA(isA<EnvelopeError>()));
   });
 
-  test('rejects malformed bytes', () {
+  test('rejects CBOR that decodes to a non-map', () {
+    // `utf8.encode('not cbor at all')` is well-formed CBOR: 0x6E is a
+    // major-type-3 (text string) header declaring length 14, and 14 bytes
+    // follow, so this decodes successfully to the string "ot cbor at all".
+    // This exercises the `decoded is! Map` guard, not the CBOR parse-error
+    // path (see the "rejects genuinely malformed CBOR bytes" test below).
     expect(() => decodeEnvelope(utf8.encode('not cbor at all')),
+        throwsA(isA<EnvelopeError>()));
+  });
+
+  test('rejects genuinely malformed CBOR bytes', () {
+    // 0x6E is a major-type-3 (text string) header declaring length 14, but
+    // only 2 bytes follow. This is truncated CBOR that package:cbor cannot
+    // parse at all, so it must be caught by decodeEnvelope's `catch` around
+    // cbor.decode (verified empirically to throw a FormatException there),
+    // not by any downstream type check.
+    expect(() => decodeEnvelope(const [0x6E, 0x61, 0x62]),
+        throwsA(isA<EnvelopeError>()));
+  });
+
+  test('rejects a payload map with non-string keys', () {
+    // A hostile peer could send an integer key `0` alongside a string key
+    // `"0"`. Both are distinct, valid CBOR map keys, but naively coercing
+    // keys with `.toString()` would collide them, letting the
+    // later-inserted entry silently win and potentially override a
+    // legitimate field. decodeEnvelope must reject this outright instead
+    // of coercing.
+    final rawPayload = CborMap({
+      const CborSmallInt(0): CborString('malicious'),
+      CborString('0'): CborString('legit'),
+    });
+    expect(() => decodeEnvelope(encodeEnvelopeWithRawPayload(rawPayload)),
         throwsA(isA<EnvelopeError>()));
   });
 

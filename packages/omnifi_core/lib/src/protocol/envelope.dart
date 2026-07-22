@@ -73,12 +73,21 @@ Envelope decodeEnvelope(List<int> bytes) {
     throw const EnvelopeError('malformed envelope payload');
   }
 
+  final convertedPayload = <String, Object?>{};
+  for (final entry in payload.entries) {
+    final key = entry.key;
+    if (key is! String) {
+      throw const EnvelopeError('payload map contains a non-string key');
+    }
+    convertedPayload[key] = entry.value;
+  }
+
   return Envelope(
     version: version,
     type: MessageType.fromWireName(type),
     senderDeviceId: from,
     messageId: mid,
     timestampMs: ts,
-    payload: payload.map((k, v) => MapEntry(k.toString(), v)),
+    payload: convertedPayload,
   );
 }
