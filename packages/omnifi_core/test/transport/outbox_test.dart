@@ -78,6 +78,38 @@ void main() {
         throwsA(isA<ArgumentError>()));
   });
 
+  test('a collapse replacement is never evicted by its own bounds check', () {
+    // Reviewer's confirmed repro: A is queued at the front under key 'k'.
+    // B fills the outbox to exactly the byte cap. The third add() replaces
+    // A in place with a larger frame under the same key, pushing the total
+    // over the cap. The eviction loop must not evict the entry add() was
+    // just asked to queue (the collapsed replacement) -- it must evict the
+    // older, unrelated frame B instead.
+    final o = Outbox();
+    o.add(Uint8List(1), collapseKey: 'k'); // A, at the front
+    o.add(Uint8List(maxOutboxBytes - 1)); // B, fills to exactly the cap
+    o.add(Uint8List(maxOutboxBytes), collapseKey: 'k'); // replaces A in place
+
+    final drained = o.drain();
+    expect(drained.length, 1);
+    expect(drained.single.frame.length, maxOutboxBytes);
+    expect(o.droppedCount, 1);
+  });
+
+  test('a plain (non-collapsed) append is also protected from eviction', () {
+    final o = Outbox();
+    // Fill the queue to exactly the byte cap.
+    o.add(Uint8List(maxOutboxBytes - 1));
+    // Now append one more large frame with no collapse key; this pushes the
+    // total over the cap and must trigger eviction of the older frame, not
+    // the just-appended one.
+    o.add(Uint8List(maxOutboxBytes));
+
+    final drained = o.drain();
+    expect(drained.length, 1);
+    expect(drained.single.frame.length, maxOutboxBytes);
+  });
+
   test('clear resets contents but not the dropped counter', () {
     final o = Outbox();
     for (var i = 0; i < maxOutboxFrames + 1; i++) {

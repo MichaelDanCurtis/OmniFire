@@ -44,21 +44,40 @@ class Outbox {
         _entries
           ..clear()
           ..addAll(existing);
-        _enforceBounds();
+        _enforceBounds(protect: entry);
         return;
       }
     }
 
     _entries.addLast(entry);
     _byteLength += entry.frame.length;
-    _enforceBounds();
+    _enforceBounds(protect: entry);
   }
 
-  void _enforceBounds() {
+  /// Evicts the oldest entries until both bounds are satisfied, never
+  /// evicting [protect] -- the entry the current `add()` call just
+  /// inserted or collapsed into.
+  ///
+  /// Termination is guaranteed: `add()` already rejects any single frame
+  /// larger than the entire byte budget before mutating anything, so
+  /// [protect] alone always fits within the cap. That means this loop can
+  /// always either find a non-protected victim to evict, or the bounds are
+  /// already satisfied and the loop exits. The `break` below is defensive
+  /// only, so that a future change to that precondition degrades into a
+  /// bounds violation rather than an infinite loop.
+  void _enforceBounds({OutboxEntry? protect}) {
     while (_entries.length > maxOutboxFrames ||
         _byteLength > maxOutboxBytes) {
-      final dropped = _entries.removeFirst();
-      _byteLength -= dropped.frame.length;
+      OutboxEntry? victim;
+      for (final e in _entries) {
+        if (!identical(e, protect)) {
+          victim = e;
+          break;
+        }
+      }
+      if (victim == null) break;
+      _entries.remove(victim);
+      _byteLength -= victim.frame.length;
       _droppedCount++;
     }
   }
