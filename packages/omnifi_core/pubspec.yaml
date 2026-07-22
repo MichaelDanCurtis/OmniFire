@@ -9,7 +9,9 @@ environment:
 dependencies:
   cryptography: ^2.7.0
   cbor: ^6.3.0
+  web_socket_channel: ^3.0.0
 
 dev_dependencies:
   test: ^1.25.0
   lints: ^4.0.0
+  stream_channel: ^2.1.0
