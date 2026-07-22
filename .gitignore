@@ -6,3 +6,5 @@ node_modules/
 *.iml
 .idea/
 .superpowers/
+relay/node_modules/
+relay/.wrangler/
