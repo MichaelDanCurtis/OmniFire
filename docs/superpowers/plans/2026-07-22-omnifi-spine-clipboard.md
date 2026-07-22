@@ -2312,12 +2312,26 @@ class Mesh {
 
 Future<Mesh> loadOrCreateMesh({required SecureStore store}) async {
   final existingId = await store.read(_kMeshId);
+  final existingRoster = await store.read(_kRoster);
+
+  // All-or-nothing, in BOTH directions. The mirror case matters more than the
+  // obvious one: a roster present with no mesh ID would otherwise mint a fresh
+  // mesh ID and saveMesh() straight over the existing roster, destroying every
+  // paired device silently. That is worse than failing closed — it is data loss.
+  if ((existingId == null) != (existingRoster == null)) {
+    throw const MeshError(
+        'mesh state is incomplete: exactly one of the mesh id and the roster '
+        'is present. Refusing to continue, because creating a new mesh here '
+        'would overwrite the surviving half. Restore the missing entry, or '
+        'delete omnifi.mesh.* to deliberately start a new mesh.');
+  }
+
   if (existingId == null) {
     final mesh = Mesh(meshId: randomHexId());
     await saveMesh(mesh, store);
     return mesh;
   }
-  final roster = await store.read(_kRoster);
+  final roster = existingRoster;
   if (roster == null) {
     // Same all-or-nothing rule as loadOrCreateIdentity: a stored mesh ID with
     // no roster means the two SecureStore keys diverged (partial write, storage
