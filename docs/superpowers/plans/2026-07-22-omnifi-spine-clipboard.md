@@ -4230,21 +4230,21 @@ class PairingFlow {
     required String meshId,
     required bool isInitiator,
   }) async {
-    // During pairing neither side has the other's static key in the roster,
-    // so both use the inviter's advertised key as the handshake peer key and
-    // rely on the PSK for authentication. A mismatched PSK changes the
-    // master secret, which changes the SAS, which the user sees.
+    // Neither side knows the other's static key yet — that is what pairing
+    // establishes — so `expectedPeerStaticPublicKey` is null and each side
+    // LEARNS the peer's key from the handshake message. Authentication comes
+    // from the PSK in the QR invite (mixed into the HKDF salt) plus the SAS
+    // the user compares below. A mismatched PSK changes the master secret,
+    // which changes the SAS, which the user sees.
     final handshake = isInitiator
         ? OmniFiHandshakeV1.initiator(
             staticKeys: identity.keys,
             deviceId: identity.deviceId,
-            peerStaticPublicKey: invite.inviterPublicKey,
             psk: invite.psk,
           )
         : OmniFiHandshakeV1.responder(
             staticKeys: identity.keys,
             deviceId: identity.deviceId,
-            peerStaticPublicKey: invite.inviterPublicKey,
             psk: invite.psk,
           );
 
