@@ -552,16 +552,26 @@ Implements **OmniFi Session Handshake v1**, the construction selected as option 
 
 Both parties hold a static X25519 keypair. The initiator knows the responder's static public key; after pairing, the responder knows the initiator's too. During *pairing* the parties do not yet know each other's static keys, so a pre-shared key from the QR payload is mixed in instead — that variant is `psk`.
 
-1. Initiator generates ephemeral `ei`, sends `HS1 = CBOR{v, deviceId, ePub}`.
-2. Responder generates ephemeral `er`, sends `HS2 = CBOR{v, deviceId, ePub}`.
-3. Both compute three Diffie-Hellman results:
+1. Initiator generates ephemeral `ei`, sends `HS1 = CBOR{v, deviceId, ePub, sPub}`.
+2. Responder generates ephemeral `er`, sends `HS2 = CBOR{v, deviceId, ePub, sPub}`.
+3. Each side **learns the peer's static public key from the peer's message** and computes three Diffie-Hellman results against it:
    - `dh_ee = DH(e_self, e_peer)` — provides forward secrecy
    - `dh_es = DH(e_initiator, s_responder)` — authenticates the responder
    - `dh_se = DH(s_initiator, e_responder)` — authenticates the initiator
 4. `transcript = HS1_bytes || HS2_bytes` (initiator's message always first).
 5. `master = HKDF-SHA256(ikm: dh_ee || dh_es || dh_se, salt: transcript || psk, info: "omnifi-session-v1", length: 32)`
-6. `k_i2r = HKDF-Expand(master, info: "i2r", 32)`, `k_r2i = HKDF-Expand(master, info: "r2i", 32)`
-7. Each side seals the literal bytes `omnifi-confirm` with counter 0 and `aad = transcript`, and sends it. Failure to open the peer's confirmation aborts the handshake.
+6. Four keys are expanded from `master`, **two for data and two for confirmation**:
+   - `k_i2r = HKDF-Expand(master, info: "i2r", 32)`, `k_r2i = HKDF-Expand(master, info: "r2i", 32)` — the returned session
+   - `k_i2r_confirm = HKDF-Expand(master, info: "i2r-confirm", 32)`, `k_r2i_confirm = HKDF-Expand(master, info: "r2i-confirm", 32)` — used *only* for step 7
+7. Each side seals the literal bytes `omnifi-confirm` under its **confirmation** key with counter 0 and `aad = transcript`, and sends it. Failure to open the peer's confirmation aborts the handshake.
+
+**Why confirmation gets its own keys — this is not optional.** An earlier draft sealed the confirmation under `k_i2r`/`k_r2i` at counter 0 and then returned a fresh `AeadSession` on the same keys, whose send counter also starts at 0. That is (key, nonce) reuse. Because the confirmation plaintext is the public constant `omnifi-confirm`, an observer XORs it against the confirmation ciphertext to recover the counter-0 keystream, then XORs that against the first data frame — disclosing its first 14 bytes. Worse, RFC 8439 derives the Poly1305 one-time key from ChaCha20 block counter 0 under the same nonce, so the reuse also exposes the authentication key and permits forgery. Differing AAD does not mitigate any of this: AAD is authenticated but neither the keystream nor the Poly1305 key depends on it. Separate `-confirm` keys remove the collision entirely.
+
+**Authenticating the learned static key.** The constructor takes `expectedPeerStaticPublicKey` as an **optional** parameter:
+- **Post-pairing** (the roster already holds the peer's key): pass it. After decoding the peer's message the handshake MUST compare the learned key against it and abort with `HandshakeError` on mismatch. This is what makes a session to a known device mutually authenticated.
+- **During pairing** (neither side yet knows the other's static key): pass `null`. Authentication comes from the pre-shared key carried in the QR invite, mixed into the HKDF salt, plus the user's SAS comparison. The static keys are learned here and written to the roster on confirmation.
+
+The earlier draft made this parameter required and had the inviting side pass *its own* public key, which would have made the two sides compute different `dh_es` values and fail to agree on a key at all.
 
 Mutual authentication holds because only the holder of `s_responder` can compute `dh_es`, and only the holder of `s_initiator` can compute `dh_se`. Forward secrecy holds because `dh_ee` requires an ephemeral private key that is discarded after the handshake.
 
@@ -577,9 +587,9 @@ Mutual authentication holds because only the holder of `s_responder` can compute
   - `class HandshakeResult { final AeadSession session; final List<int> transcript; final List<int> master; final List<int> peerStaticPublicKey; }`
   - `abstract interface class Handshake` with:
     - `Future<Uint8List> start()` — returns the local handshake message
+    - `Future<Uint8List> confirmationFor(List<int> peerMessage)`
     - `Future<HandshakeResult> complete(List<int> peerMessage, List<int> peerConfirmation)`
-    - `Future<Uint8List> confirmation()`
-  - `class OmniFiHandshakeV1 implements Handshake` with named constructors `.initiator(...)` and `.responder(...)`, each taking `{required StaticKeyPair staticKeys, required String deviceId, List<int>? peerStaticPublicKey, List<int> psk = const []}`
+  - `class OmniFiHandshakeV1 implements Handshake` with named constructors `.initiator(...)` and `.responder(...)`, each taking `{required StaticKeyPair staticKeys, required String deviceId, List<int>? expectedPeerStaticPublicKey, List<int> psk = const []}`
   - `class HandshakeError implements Exception`
 
 - [ ] **Step 1: Write the failing tests**
