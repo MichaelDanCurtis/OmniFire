@@ -2679,7 +2679,9 @@ git commit -m "feat: add Link interface with LAN-preferring quality ranking"
   - `class OutboxEntry { final Uint8List frame; final String? collapseKey; }`
   - `class Outbox` with `void add(List<int> frame, {String? collapseKey})`, `List<OutboxEntry> drain()`, `int get length`, `int get byteLength`, `int get droppedCount`, `void clear()`
 
-`collapseKey` is how stale clipboard updates are discarded: adding an entry whose key matches an existing one replaces it in place rather than queueing a second copy. Nobody wants four stale clipboards delivered on reconnect.
+`collapseKey` is how stale clipboard updates are discarded: adding an entry whose key matches an existing one **removes the old entry and appends the new one at the tail**, rather than queueing a second copy. Nobody wants four stale clipboards delivered on reconnect.
+
+**It must append, not replace in place.** An earlier draft of this plan specified position preservation, reasoning that moving the entry would let a clipboard update overtake messages queued behind it. That is backwards for counter-bearing frames: `AeadSession.seal` assigns a monotonic counter at seal time and the receiver rejects any counter that does not strictly advance — fatally. The replacement is sealed **last**, so it belongs **last**. Preserving the original slot put a later-sealed frame ahead of an earlier one, which killed the receiving session and lost the intervening frame.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2724,12 +2726,15 @@ void main() {
     expect(utf8.decode(drained.single.frame), 'fresh');
   });
 
-  test('collapse preserves the original queue position', () {
+  test('collapse moves the replacement to the tail, preserving seal order', () {
+    // NOT position-preserving. Frames carry monotonic AEAD counters assigned at
+    // seal time and the receiver rejects any counter that does not strictly
+    // advance, fatally. The replacement was sealed LAST, so it must go LAST.
     final o = Outbox();
     o.add(utf8.encode('first'), collapseKey: 'clipboard');
     o.add(utf8.encode('second'));
     o.add(utf8.encode('third'), collapseKey: 'clipboard');
-    expect(o.drain().map((e) => utf8.decode(e.frame)), ['third', 'second']);
+    expect(o.drain().map((e) => utf8.decode(e.frame)), ['second', 'third']);
   });
 
   test('entries without a key never collapse', () {
@@ -2849,8 +2854,8 @@ class Outbox {
   /// Evicts oldest-first until both bounds hold, never evicting [protect].
   ///
   /// [protect] is the entry this call just added or collapsed into. Without
-  /// that exemption a large collapsed replacement — which keeps its ORIGINAL
-  /// queue position, often near the front — gets evicted by its own insertion
+  /// that exemption a large replacement — appended at the tail — could still be
+  /// evicted by its own insertion
   /// while older unrelated frames survive. For a clipboard queue that inverts
   /// the point of collapsing: the freshest content is what disappears.
   ///
