@@ -363,7 +363,7 @@ void main() {
     expect(errors.length, 1);
   });
 
-  test('a stale link delivers nothing after migration', () async {
+  test('a stale link delivers nothing once migration is complete', () async {
     final s = sessionPair();
     final first = FakeLink.connectedPair();
     s.b.attach(first.b);
@@ -374,23 +374,59 @@ void main() {
 
     final sender =
         AeadSession(sendKey: _aSendKey, receiveKey: _aReceiveKey);
-    final frame = await sealAsPeerA(sender, MessageType.heartbeat);
 
-    // Frame is in flight inside _onFrame at the moment the session migrates:
-    // the microtask that starts decryption has already run.
-    first.b.deliver(frame);
-    await null;
     final second = FakeLink.connectedPair();
     s.b.attach(second.b);
     await Future<void>.delayed(const Duration(milliseconds: 50));
 
-    expect(seen, isEmpty);
-    expect(errors, isEmpty);
-
-    // And the abandoned link stays silent afterwards too.
+    // A frame delivered on the abandoned link, which has not begun
+    // decryption, is dropped by the pre-decrypt generation guard. (A frame
+    // that was already mid-decrypt at the moment of migration is a
+    // different case, covered separately: it authenticates successfully and
+    // must still be delivered -- see "a frame already mid-decrypt at
+    // migration is still delivered..." below.)
     first.b.deliver(await sealAsPeerA(sender, MessageType.heartbeat));
     await Future<void>.delayed(const Duration(milliseconds: 50));
     expect(seen, isEmpty);
+    expect(errors, isEmpty);
+  });
+
+  test(
+      'a frame already mid-decrypt at migration is still delivered, but one '
+      'that has not begun decrypting is not', () async {
+    final s = sessionPair();
+    final first = DelayedLink.pair();
+    s.b.attach(first.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+    final errors = <Object>[];
+    s.b.errors.listen(errors.add);
+
+    final sender = AeadSession(sendKey: _aSendKey, receiveKey: _aReceiveKey);
+    final inFlightFrame = await sealAsPeerA(sender, MessageType.heartbeat);
+
+    // Frame is in flight inside _onFrame at the moment the session
+    // migrates: the microtask that starts decryption has already run, so
+    // AeadSession.open is genuinely suspended mid-decrypt when attach(B)
+    // bumps the generation.
+    first.b.deliver(inFlightFrame);
+    await null;
+    final second = DelayedLink.pair();
+    s.b.attach(second.b);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    // The frame authenticated successfully under the session key, so it is
+    // genuinely from the peer and the receive counter has already moved
+    // past it -- discarding it here would be irrecoverable data loss.
+    expect(seen.length, 1);
+    expect(errors, isEmpty);
+
+    // A second frame delivered on the now-abandoned link, which has not
+    // begun decryption, must still be dropped by the pre-decrypt
+    // generation guard.
+    first.b.deliver(await sealAsPeerA(sender, MessageType.heartbeat));
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(seen.length, 1);
     expect(errors, isEmpty);
   });
 }

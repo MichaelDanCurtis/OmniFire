@@ -195,9 +195,17 @@ class PeerSession {
       _fail('undecryptable frame: $e');
       return;
     }
-    // The session may have died, or migrated off this link, while we were
-    // decrypting.
-    if (_isStale(generation)) return;
+    // Deliberately no generation re-check here. AeadSession.open has
+    // already authenticated this frame and, on success, irreversibly
+    // advanced the receive counter — so a retransmission would now be
+    // rejected as a replay. The link a frame arrived on says nothing about
+    // whether it is really from the peer; only decryption does. Discarding
+    // an authenticated frame at this point because it arrived on a
+    // since-migrated-off link would destroy data the peer can never resend,
+    // for no security benefit: do not "tighten" this back in. We still bail
+    // out if the session died (e.g. a concurrent frame failed to
+    // authenticate) — that is a real trust event, unrelated to generation.
+    if (_dead) return;
 
     final Envelope envelope;
     try {
