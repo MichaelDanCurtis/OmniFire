@@ -48,6 +48,34 @@ class PeerSession {
   StreamSubscription<Uint8List>? _linkSub;
   bool _dead = false;
 
+  /// Tail of the outbound serialization chain. Every outbound operation
+  /// chains onto it so that sealing and transmitting are one indivisible
+  /// step: [AeadSession.seal] assigns a monotonic counter, and the receiver
+  /// rejects anything that arrives out of counter order, so a reordering
+  /// between seal and write is fatal to the session.
+  Future<void> _outboundTail = Future<void>.value();
+
+  /// Bumped on every [attach]. Frames carrying a stale generation come from
+  /// a link the session has already migrated off and are discarded.
+  int _generation = 0;
+
+  /// Runs [action] after every previously queued outbound action.
+  ///
+  /// The chained callback swallows failures into the per-call completer, so
+  /// one failing action never leaves [_outboundTail] in a rejected state
+  /// that would poison every later send.
+  Future<T> _serialized<T>(Future<T> Function() action) {
+    final completer = Completer<T>();
+    _outboundTail = _outboundTail.then((_) async {
+      try {
+        completer.complete(await action());
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+    return completer.future;
+  }
+
   Link? get link => _link;
   Stream<Envelope> get inbound => _inbound.stream;
   Stream<Object> get errors => _errors.stream;
@@ -58,30 +86,48 @@ class PeerSession {
   /// Moves the session onto [link], replacing any current link, then
   /// flushes anything queued while detached.
   void attach(Link link) {
-    _linkSub?.cancel();
+    // Cancelling is asynchronous, so the old link can still push a frame
+    // that is already in flight. The generation stamp, not the cancel, is
+    // what stops a stale frame from being acted on.
+    unawaited(_linkSub?.cancel() ?? Future<void>.value());
     _link = link;
-    _linkSub = link.inbound.listen(_onFrame, onError: _errors.add);
-    unawaited(_flush());
+    final generation = ++_generation;
+    _linkSub = link.inbound.listen(
+      (frame) => _onFrame(frame, generation),
+      onError: (Object error) => _emitError(error),
+    );
+    unawaited(_flush().catchError((Object _) {}));
   }
 
   Future<void> send(
     MessageType type,
     Map<String, Object?> payload, {
     String? collapseKey,
-  }) async {
+  }) {
+    // The whole build-seal-dispatch sequence runs under the outbound lock.
+    // Sealing outside it would assign the nonce counter outside the lock
+    // and reintroduce the reordering this serialization exists to prevent.
+    return _serialized(() async {
+      _throwIfDead();
+      final envelope = Envelope(
+        version: omnifiProtocolVersion,
+        type: type,
+        senderDeviceId: localDeviceId,
+        messageId: randomHexId(),
+        timestampMs: _clock(),
+        payload: payload,
+      );
+      final sealed = await _crypto.seal(encodeEnvelope(envelope));
+      // The session can have died while we were sealing.
+      _throwIfDead();
+      await _dispatch(sealed, collapseKey: collapseKey);
+    });
+  }
+
+  void _throwIfDead() {
     if (_dead) {
       throw const SessionRejectedError('session is dead; re-handshake first');
     }
-    final envelope = Envelope(
-      version: omnifiProtocolVersion,
-      type: type,
-      senderDeviceId: localDeviceId,
-      messageId: randomHexId(),
-      timestampMs: _clock(),
-      payload: payload,
-    );
-    final sealed = await _crypto.seal(encodeEnvelope(envelope));
-    await _dispatch(sealed, collapseKey: collapseKey);
   }
 
   Future<void> _dispatch(Uint8List frame, {String? collapseKey}) async {
@@ -99,31 +145,59 @@ class PeerSession {
     }
   }
 
-  Future<void> _flush() async {
-    final link = _link;
-    if (link == null || link.state != LinkState.connected) return;
-    for (final entry in _outbox.drain()) {
+  Future<void> _flush() => _serialized(_flushLocked);
+
+  Future<void> _flushLocked() async {
+    final start = _link;
+    if (start == null || start.state != LinkState.connected) return;
+    final entries = _outbox.drain();
+    for (var i = 0; i < entries.length; i++) {
+      // Re-read the link every iteration: an attach() between writes would
+      // otherwise leave the rest of the flush writing to an abandoned link.
+      final link = _link;
+      if (link == null ||
+          !identical(link, start) ||
+          link.state != LinkState.connected) {
+        _requeueFrom(entries, i);
+        return;
+      }
       try {
-        await link.send(entry.frame);
+        await link.send(entries[i].frame);
       } on Object {
-        _outbox.add(entry.frame, collapseKey: entry.collapseKey);
+        _requeueFrom(entries, i);
         return;
       }
     }
   }
 
-  Future<void> _onFrame(Uint8List frame) async {
-    if (_dead) return;
+  /// Puts [entries] from [from] onward back on the outbox, in order.
+  ///
+  /// Safe because the outbound lock guarantees no concurrent send can have
+  /// added anything since [Outbox.drain] emptied the queue, so re-adding in
+  /// order reproduces the original order exactly.
+  void _requeueFrom(List<OutboxEntry> entries, int from) {
+    for (var i = from; i < entries.length; i++) {
+      _outbox.add(entries[i].frame, collapseKey: entries[i].collapseKey);
+    }
+  }
+
+  Future<void> _onFrame(Uint8List frame, int generation) async {
+    if (_isStale(generation)) return;
     final Uint8List plaintext;
     try {
       plaintext = await _crypto.open(frame);
     } on ReplayError catch (e) {
+      if (_isStale(generation)) return;
       _fail('replayed frame: $e');
       return;
     } on DecryptionError catch (e) {
+      if (_isStale(generation)) return;
       _fail('undecryptable frame: $e');
       return;
     }
+    // The session may have died, or migrated off this link, while we were
+    // decrypting.
+    if (_isStale(generation)) return;
 
     final Envelope envelope;
     try {
@@ -139,16 +213,29 @@ class PeerSession {
       return;
     }
 
-    _inbound.add(envelope);
+    if (!_inbound.isClosed) _inbound.add(envelope);
   }
 
+  /// True when this frame must not be acted on: the session is dead, or the
+  /// frame arrived on a link the session has since migrated off.
+  bool _isStale(int generation) => _dead || generation != _generation;
+
   void _fail(String reason) {
+    if (_dead) return;
     _dead = true;
-    _errors.add(SessionRejectedError(reason));
+    _emitError(SessionRejectedError(reason));
+  }
+
+  void _emitError(Object error) {
+    if (!_errors.isClosed) _errors.add(error);
   }
 
   Future<void> dispose() async {
+    // Retire the current generation so a frame already in flight cannot
+    // reach a closed controller.
+    _generation++;
     await _linkSub?.cancel();
+    _linkSub = null;
     await _inbound.close();
     await _errors.close();
   }
