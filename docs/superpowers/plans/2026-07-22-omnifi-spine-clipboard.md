@@ -4932,7 +4932,13 @@ class ClipboardSync {
     }
     if (payload.data.length > maxClipboardBytes) return;
 
-    _lastAppliedHash = payload.contentHash;
+    // Recompute rather than trusting the peer's `contentHash`. The stored hash
+    // is what suppresses our own write echoing back through the platform
+    // watcher; if a peer sends a hash that does not match its own payload —
+    // through a bug or deliberately — the echo check never matches and the two
+    // devices ping-pong forever, which is the one failure this feature exists
+    // to prevent. Recomputing is self-validating and costs a single hash.
+    _lastAppliedHash = clipboardHash(payload.format, payload.data);
     _lastAppliedTimestampMs = payload.timestampMs;
 
     await _watcher.write(ClipboardContent(
