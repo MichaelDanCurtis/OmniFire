@@ -36,12 +36,19 @@ void main() {
     expect(utf8.decode(drained.single.frame), 'fresh');
   });
 
-  test('collapse preserves the original queue position', () {
+  test('collapse moves the replacement to the tail', () {
+    // This test used to assert the opposite -- that the replacement inherited
+    // the superseded entry's queue position. That was a design error. Frames
+    // are sealed with a monotonic counter before they are queued, and the
+    // receiver treats a counter that does not strictly advance as fatal, so
+    // seal order must equal wire order. 'third' was sealed after 'second', so
+    // it must go out after 'second'; preserving 'first''s position would put
+    // it on the wire first and tear the receiving session down.
     final o = Outbox();
     o.add(utf8.encode('first'), collapseKey: 'clipboard');
     o.add(utf8.encode('second'));
     o.add(utf8.encode('third'), collapseKey: 'clipboard');
-    expect(o.drain().map((e) => utf8.decode(e.frame)), ['third', 'second']);
+    expect(o.drain().map((e) => utf8.decode(e.frame)), ['second', 'third']);
   });
 
   test('entries without a key never collapse', () {

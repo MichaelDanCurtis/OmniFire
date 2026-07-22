@@ -44,6 +44,12 @@ class PeerSession {
   final StreamController<Object> _errors =
       StreamController<Object>.broadcast();
 
+  /// How long to wait before re-attempting a flush after a failed write.
+  /// Short enough that a transient failure self-heals promptly, long enough
+  /// that a persistently failing link is retried at a modest rate.
+  static const Duration outboundRetryDelay = Duration(milliseconds: 500);
+
+  Timer? _retry;
   Link? _link;
   StreamSubscription<Uint8List>? _linkSub;
   StreamSubscription<LinkState>? _stateSub;
@@ -88,6 +94,10 @@ class PeerSession {
   /// Moves the session onto [link], replacing any current link, then
   /// flushes anything queued while detached.
   void attach(Link link) {
+    // A disposed session owns no link and will never drain its outbox again.
+    // Re-subscribing here would resurrect it: the flush below would write
+    // leftover frames to a link the caller has moved on to.
+    if (_disposed) return;
     // Cancelling is asynchronous, so the old link can still push a frame
     // that is already in flight. The generation stamp, not the cancel, is
     // what stops a stale frame from being acted on.
@@ -172,11 +182,39 @@ class PeerSession {
     }
     try {
       await link.send(frame);
-    } on Object {
+    } on Object catch (e) {
       // The socket died mid-write. Requeue so the frame survives the
       // reconnect rather than vanishing.
       _outbox.add(frame, collapseKey: collapseKey);
+      _onWriteFailure(e);
     }
+  }
+
+  /// Handles a write that failed mid-flight, after the frame has been put
+  /// back on the outbox.
+  ///
+  /// A link can fail a write and stay `connected` -- that is what a real
+  /// socket does on a transient write error -- so no state transition is
+  /// guaranteed to arrive and re-trigger a flush. Without this, one failed
+  /// write mutes the session permanently while it still reports itself
+  /// healthy, because every later send sees a non-empty outbox and queues
+  /// behind the stuck frame.
+  ///
+  /// The session is deliberately *not* marked dead: a failed write is not an
+  /// authentication failure and must not force a re-handshake.
+  ///
+  /// Retry policy stays deliberately trivial -- one delayed re-attempt per
+  /// failure, at most one outstanding. Real backoff belongs to LinkManager,
+  /// which owns reconnection.
+  void _onWriteFailure(Object error) {
+    _emitError(error);
+    if (_disposed) return;
+    _retry?.cancel();
+    _retry = Timer(outboundRetryDelay, () {
+      _retry = null;
+      if (_disposed || _dead) return;
+      unawaited(_flush().catchError((Object _) {}));
+    });
   }
 
   Future<void> _flush() => _serialized(_flushLocked);
@@ -197,8 +235,9 @@ class PeerSession {
       }
       try {
         await link.send(entries[i].frame);
-      } on Object {
+      } on Object catch (e) {
         _requeueFrom(entries, i);
+        _onWriteFailure(e);
         return;
       }
     }
@@ -279,6 +318,8 @@ class PeerSession {
     // to a link the session no longer manages, or queue into an outbox
     // nobody will ever drain.
     _disposed = true;
+    _retry?.cancel();
+    _retry = null;
     // Retire the current generation so a frame already in flight cannot
     // reach a closed controller.
     _generation++;

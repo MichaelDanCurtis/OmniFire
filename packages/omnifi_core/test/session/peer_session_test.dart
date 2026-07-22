@@ -588,6 +588,89 @@ void main() {
     expect(s.a.queuedFrameCount, 0);
   });
 
+  test('a collapsed frame goes out last, not in the superseded slot',
+      () async {
+    // Reviewer's confirmed repro. 'clip-old' seals counter 0, 'other' seals
+    // counter 1, 'clip-new' seals counter 2 and collapses 'clip-old' away.
+    // If the replacement inherited the superseded entry's queue position,
+    // counter 2 would hit the wire before counter 1 and the receiver would
+    // tear the session down on the non-advancing counter, losing 'other'.
+    final s = sessionPair();
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'clip-old'},
+        collapseKey: 'clip');
+    await s.a.send(MessageType.heartbeat, {'text': 'other'});
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'clip-new'},
+        collapseKey: 'clip');
+    expect(s.a.queuedFrameCount, 2);
+
+    final links = DelayedLink.pair();
+    s.b.attach(links.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+    final errors = <Object>[];
+    s.b.errors.listen(errors.add);
+
+    s.a.attach(links.a);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    expect(seen.map((e) => e.payload['text']).toList(), ['other', 'clip-new']);
+    expect(errors, isEmpty);
+    expect(s.b.isDead, isFalse);
+    expect(s.a.queuedFrameCount, 0);
+  });
+
+  test('a failed write is reported and retried rather than stalling forever',
+      () async {
+    // The link stays `connected` after the failed write -- what a real socket
+    // does on a transient write error -- so no state transition will ever
+    // arrive to trigger a flush. The session must arm its own retry, and must
+    // say on `errors` that the outbound path stumbled, without dying: a
+    // failed write is not an authentication failure.
+    final s = sessionPair();
+    final links = DelayedLink.pair();
+    s.b.attach(links.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+    final errors = <Object>[];
+    s.a.errors.listen(errors.add);
+
+    links.a.failAt.add(0);
+    s.a.attach(links.a);
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'one'});
+    for (var i = 1; i < 6; i++) {
+      await s.a.send(MessageType.clipboardUpdate, {'text': 'f$i'});
+    }
+    expect(s.a.queuedFrameCount, 6);
+    expect(errors, isNotEmpty);
+
+    for (var i = 0; i < 60 && s.a.queuedFrameCount > 0; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    // The outbox empties when the flush starts, not when the last write
+    // lands, so let the in-flight writes settle before checking the wire.
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    expect(s.a.queuedFrameCount, 0);
+    expect(s.a.isDead, isFalse);
+    expect(seen.map((e) => e.payload['text']).toList(),
+        ['one', 'f1', 'f2', 'f3', 'f4', 'f5']);
+    expect(s.b.isDead, isFalse);
+  });
+
+  test('attach after dispose does not resurrect the session', () async {
+    final s = sessionPair();
+    // Queue something so a stray flush would have material to write.
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'queued'});
+    await s.a.dispose();
+
+    final links = DelayedLink.pair();
+    s.a.attach(links.a);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    expect(links.a.sent, isEmpty);
+    expect(s.a.link, isNull);
+  });
+
   test('a stale link stream error is not emitted after migration', () async {
     final s = sessionPair();
     final first = LaggyCancelLink('laggy-first');

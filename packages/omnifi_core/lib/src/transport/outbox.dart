@@ -34,18 +34,22 @@ class Outbox {
     );
 
     if (collapseKey != null) {
-      final existing = _entries.toList();
-      final index =
-          existing.indexWhere((e) => e.collapseKey == collapseKey);
-      if (index >= 0) {
-        _byteLength -= existing[index].frame.length;
-        existing[index] = entry;
-        _byteLength += entry.frame.length;
-        _entries
-          ..clear()
-          ..addAll(existing);
-        _enforceBounds(protect: entry);
-        return;
+      // Remove-and-append, never replace in place. Frames reach the outbox
+      // already sealed, and sealing assigns a monotonic counter the receiver
+      // rejects out of order, so seal order must equal wire order. The
+      // replacement was sealed last, so it belongs last: inheriting the
+      // superseded entry's queue position would put a later-sealed frame on
+      // the wire ahead of an earlier-sealed one and kill the session.
+      OutboxEntry? superseded;
+      for (final e in _entries) {
+        if (e.collapseKey == collapseKey) {
+          superseded = e;
+          break;
+        }
+      }
+      if (superseded != null) {
+        _entries.remove(superseded);
+        _byteLength -= superseded.frame.length;
       }
     }
 
