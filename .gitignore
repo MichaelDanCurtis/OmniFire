@@ -1,0 +1,7 @@
+.omc/
+.dart_tool/
+build/
+.DS_Store
+node_modules/
+*.iml
+.idea/
