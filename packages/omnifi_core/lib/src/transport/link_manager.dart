@@ -71,8 +71,19 @@ class LinkManager {
   int _attempt = 0;
   bool _running = false;
 
+  /// Bumped synchronously by every teardown ([onWake], [stop]) so a dial that
+  /// was already in flight can tell it belongs to a superseded generation.
+  /// Without it a dial completing inside a teardown's `await` window calls
+  /// [offer], re-attaching the session and registering a subscription that the
+  /// teardown's `clear()` then discards: an open link nobody tracks or closes.
+  int _dialEpoch = 0;
+
   ConnectionStatus get status => _status;
   Stream<ConnectionStatus> get statuses => _statuses.stream;
+
+  /// Links the manager currently tracks, keyed by link id. Read-only; exposed
+  /// for diagnostics and tests so an untracked-but-open link is detectable.
+  Map<String, Link> get candidates => Map<String, Link>.unmodifiable(_candidates);
 
   bool get isLive {
     final last = _lastAckMs;
@@ -86,10 +97,27 @@ class LinkManager {
   }
 
   Future<void> _dialAll() async {
+    final epoch = _dialEpoch;
     for (final dial in _dialers) {
-      unawaited(dial().then(offer).catchError((Object _) {
-        _attempt++;
-      }));
+      unawaited(dial().then(
+        (link) {
+          if (epoch != _dialEpoch) {
+            // Superseded by a teardown while this dial was in flight: close
+            // the link rather than handing the session a socket the manager
+            // has already stopped tracking.
+            unawaited(link.close());
+            return;
+          }
+          offer(link);
+        },
+        onError: (Object _) {
+          // Only a current, still-unconnected dial may grow the backoff: a
+          // stale failure, or one that lost the race to a link already
+          // adopted, must not penalise a healthy connection.
+          if (epoch != _dialEpoch || _active != null) return;
+          _attempt++;
+        },
+      ));
     }
   }
 
@@ -148,37 +176,45 @@ class LinkManager {
   /// Sleep suspends sockets without telling the peer, so on wake we tear
   /// down unconditionally instead of waiting out the liveness timeout.
   Future<void> onWake() async {
-    for (final link in _candidates.values.toList()) {
-      await link.close();
-    }
+    _dialEpoch++;
+    // Snapshot before suspending: a link disconnecting mid-teardown makes its
+    // own listener mutate these maps, which would blow up an in-place
+    // iteration with a ConcurrentModificationError.
+    final links = _candidates.values.toList();
+    final subs = _stateSubs.values.toList();
     _candidates.clear();
-    for (final sub in _stateSubs.values) {
-      await sub.cancel();
-    }
     _stateSubs.clear();
     _active = null;
     _lastAckMs = null;
-    _setStatus(ConnectionStatus.reconnecting);
-    // Unconditional: the contract for onWake is teardown *and* redial. Gating
-    // the redial on _running would strand a manager that adopted links via
-    // offer() without a start(), leaving the session attached to a socket the
-    // sleep already killed.
-    await _dialAll();
+    for (final sub in subs) {
+      await sub.cancel();
+    }
+    for (final link in links) {
+      await link.close();
+    }
+    _setStatus(
+        _running ? ConnectionStatus.reconnecting : ConnectionStatus.offline);
+    // A stopped manager stays stopped: waking must not resurrect a connection
+    // the caller explicitly tore down.
+    if (_running) await _dialAll();
   }
 
   Duration nextRetryDelay() => _backoff.delayFor(_attempt);
 
   Future<void> stop() async {
     _running = false;
-    for (final sub in _stateSubs.values) {
-      await sub.cancel();
-    }
+    _dialEpoch++;
+    final subs = _stateSubs.values.toList();
+    final links = _candidates.values.toList();
     _stateSubs.clear();
-    for (final link in _candidates.values.toList()) {
-      await link.close();
-    }
     _candidates.clear();
     _active = null;
+    for (final sub in subs) {
+      await sub.cancel();
+    }
+    for (final link in links) {
+      await link.close();
+    }
     _setStatus(ConnectionStatus.offline);
   }
 }
