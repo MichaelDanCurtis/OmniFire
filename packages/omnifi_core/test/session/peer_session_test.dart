@@ -83,6 +83,103 @@ class DelayedLink implements Link {
   }
 }
 
+/// A [Link] whose inbound subscription takes a while to actually cancel, so
+/// events raised during that window still reach the handler that was
+/// installed before migration. Real transports behave this way: `cancel()`
+/// is asynchronous, and the session must not rely on it to silence a link
+/// it has already migrated off.
+class LaggyCancelLink implements Link {
+  LaggyCancelLink(this.id,
+      {this.cancelLag = const Duration(milliseconds: 60)});
+
+  @override
+  final String id;
+  final Duration cancelLag;
+
+  final StreamController<Uint8List> _inbound =
+      StreamController<Uint8List>.broadcast();
+  final StreamController<LinkState> _states =
+      StreamController<LinkState>.broadcast();
+
+  @override
+  LinkKind get kind => LinkKind.lan;
+
+  @override
+  Stream<Uint8List> get inbound => _LaggyCancelStream<Uint8List>(
+        _inbound.stream,
+        cancelLag,
+      );
+
+  @override
+  Stream<LinkState> get states => _states.stream;
+
+  @override
+  LinkState get state => LinkState.connected;
+
+  @override
+  LinkQuality get quality => const LinkQuality(kind: LinkKind.lan);
+
+  void raise(Object error) => _inbound.addError(error);
+
+  @override
+  Future<void> send(List<int> frame) async {}
+
+  @override
+  Future<void> close() async {
+    await _inbound.close();
+    await _states.close();
+  }
+}
+
+class _LaggyCancelStream<T> extends Stream<T> {
+  _LaggyCancelStream(this._source, this._lag);
+  final Stream<T> _source;
+  final Duration _lag;
+
+  @override
+  bool get isBroadcast => true;
+
+  @override
+  StreamSubscription<T> listen(
+    void Function(T event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) =>
+      _LaggyCancelSubscription<T>(
+        _source.listen(onData,
+            onError: onError, onDone: onDone, cancelOnError: cancelOnError),
+        _lag,
+      );
+}
+
+class _LaggyCancelSubscription<T> implements StreamSubscription<T> {
+  _LaggyCancelSubscription(this._inner, this._lag);
+  final StreamSubscription<T> _inner;
+  final Duration _lag;
+
+  @override
+  Future<void> cancel() async {
+    await Future<void>.delayed(_lag);
+    await _inner.cancel();
+  }
+
+  @override
+  bool get isPaused => _inner.isPaused;
+  @override
+  void pause([Future<void>? resumeSignal]) => _inner.pause(resumeSignal);
+  @override
+  void resume() => _inner.resume();
+  @override
+  void onData(void Function(T)? handleData) => _inner.onData(handleData);
+  @override
+  void onError(Function? handleError) => _inner.onError(handleError);
+  @override
+  void onDone(void Function()? handleDone) => _inner.onDone(handleDone);
+  @override
+  Future<E> asFuture<E>([E? futureValue]) => _inner.asFuture<E>(futureValue);
+}
+
 /// Seals an envelope as device `a` would, without going through a session,
 /// so tests can inject a frame at an exact moment.
 Future<Uint8List> sealAsPeerA(AeadSession sender, MessageType type) async {
@@ -427,6 +524,86 @@ void main() {
     first.b.deliver(await sealAsPeerA(sender, MessageType.heartbeat));
     await Future<void>.delayed(const Duration(milliseconds: 50));
     expect(seen.length, 1);
+    expect(errors, isEmpty);
+  });
+
+  test('a live send does not overtake a requeued frame on the same link',
+      () async {
+    final s = sessionPair();
+    final links = DelayedLink.pair();
+    s.b.attach(links.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+    final errors = <Object>[];
+    s.b.errors.listen(errors.add);
+
+    // The first write fails mid-flight, so 'one' is requeued holding nonce
+    // counter 0 while the link stays connected.
+    links.a.failAt.add(0);
+    s.a.attach(links.a);
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'one'});
+    expect(s.a.queuedFrameCount, 1);
+
+    // 'two' seals counter 1. It must not reach the wire ahead of counter 0.
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'two'});
+
+    s.a.attach(links.a);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    expect(seen.map((e) => e.payload['text']).toList(), ['one', 'two']);
+    expect(errors, isEmpty);
+    expect(s.b.isDead, isFalse);
+    expect(s.a.queuedFrameCount, 0);
+  });
+
+  test('a link that reconnects in place drains the outbox', () async {
+    final s = sessionPair();
+    final links = DelayedLink.pair();
+    s.b.attach(links.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+    s.a.attach(links.a);
+
+    links.a.setState(LinkState.disconnected);
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'during outage'});
+    expect(s.a.queuedFrameCount, 1);
+
+    // The same link recovers without being re-attached.
+    links.a.setState(LinkState.connected);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    expect(s.a.queuedFrameCount, 0);
+    expect(seen.map((e) => e.payload['text']).toList(), ['during outage']);
+    expect(s.b.isDead, isFalse);
+  });
+
+  test('send after dispose throws and neither seals nor queues', () async {
+    final s = sessionPair();
+    await s.a.dispose();
+
+    await expectLater(
+      s.a.send(MessageType.clipboardUpdate, {'text': 'too late'}),
+      throwsA(isA<SessionRejectedError>()),
+    );
+    expect(s.a.queuedFrameCount, 0);
+  });
+
+  test('a stale link stream error is not emitted after migration', () async {
+    final s = sessionPair();
+    final first = LaggyCancelLink('laggy-first');
+    s.b.attach(first);
+    final errors = <Object>[];
+    s.b.errors.listen(errors.add);
+
+    final second = FakeLink.connectedPair();
+    s.b.attach(second.b);
+
+    // The old subscription has not finished cancelling yet, so the error
+    // still reaches the handler installed for the retired generation.
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    first.raise(const LinkClosedError('laggy-first'));
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
     expect(errors, isEmpty);
   });
 }

@@ -46,7 +46,9 @@ class PeerSession {
 
   Link? _link;
   StreamSubscription<Uint8List>? _linkSub;
+  StreamSubscription<LinkState>? _stateSub;
   bool _dead = false;
+  bool _disposed = false;
 
   /// Tail of the outbound serialization chain. Every outbound operation
   /// chains onto it so that sealing and transmitting are one indivisible
@@ -90,11 +92,34 @@ class PeerSession {
     // that is already in flight. The generation stamp, not the cancel, is
     // what stops a stale frame from being acted on.
     unawaited(_linkSub?.cancel() ?? Future<void>.value());
+    unawaited(_stateSub?.cancel() ?? Future<void>.value());
     _link = link;
     final generation = ++_generation;
     _linkSub = link.inbound.listen(
       (frame) => _onFrame(frame, generation),
-      onError: (Object error) => _emitError(error),
+      // Same generation stamp as the frame path: a link the session has
+      // already migrated off must not be able to surface an error on
+      // [errors], any more than it can surface a frame on [inbound].
+      onError: (Object error) {
+        if (_isStale(generation)) return;
+        _emitError(error);
+      },
+    );
+    // attach() is not the only moment a link becomes writable: a link can
+    // drop and recover in place without the session ever being re-attached,
+    // and anything queued during that outage has to go out before the next
+    // freshly sealed frame does.
+    _stateSub = link.states.listen(
+      (state) {
+        if (_isStale(generation)) return;
+        if (state == LinkState.connected) {
+          unawaited(_flush().catchError((Object _) {}));
+        }
+      },
+      onError: (Object error) {
+        if (_isStale(generation)) return;
+        _emitError(error);
+      },
     );
     unawaited(_flush().catchError((Object _) {}));
   }
@@ -125,6 +150,9 @@ class PeerSession {
   }
 
   void _throwIfDead() {
+    if (_disposed) {
+      throw const SessionRejectedError('session is disposed');
+    }
     if (_dead) {
       throw const SessionRejectedError('session is dead; re-handshake first');
     }
@@ -132,7 +160,13 @@ class PeerSession {
 
   Future<void> _dispatch(Uint8List frame, {String? collapseKey}) async {
     final link = _link;
-    if (link == null || link.state != LinkState.connected) {
+    // The outbox is the single FIFO for everything already sealed. Writing
+    // straight to the link while it holds anything would put a
+    // later-sealed frame on the wire ahead of an earlier-sealed one, and
+    // the receiver treats a non-advancing counter as fatal.
+    if (link == null ||
+        link.state != LinkState.connected ||
+        _outbox.length > 0) {
       _outbox.add(frame, collapseKey: collapseKey);
       return;
     }
@@ -239,11 +273,22 @@ class PeerSession {
   }
 
   Future<void> dispose() async {
+    if (_disposed) return;
+    // Mark the session unusable before anything else: a send() racing
+    // dispose() must be refused rather than seal a counter and then write
+    // to a link the session no longer manages, or queue into an outbox
+    // nobody will ever drain.
+    _disposed = true;
     // Retire the current generation so a frame already in flight cannot
     // reach a closed controller.
     _generation++;
     await _linkSub?.cancel();
     _linkSub = null;
+    await _stateSub?.cancel();
+    _stateSub = null;
+    // Let any already-queued outbound action finish (it will refuse itself
+    // via _throwIfDead) so nothing runs after the controllers are closed.
+    await _outboundTail;
     await _inbound.close();
     await _errors.close();
   }
