@@ -24,9 +24,21 @@ class LinkQuality {
   /// happens to be fast right now still costs a round trip through
   /// Cloudflare and cannot carry the media features planned for projects
   /// 3 and 4. Within a kind, a measured RTT outranks an unmeasured one.
+  /// Width of one kind's score band. Every score a kind can produce is
+  /// strictly less than this, so the LAN band [0, _kindBand) can never reach
+  /// the relay band [_kindBand, ...) no matter how bad a measured RTT is.
+  static const int _kindBand = 1000000;
+
+  /// Sentinel for "no RTT measured yet": the largest value inside a band, so
+  /// it always ranks behind any measured RTT of the same kind.
+  static const int _unmeasuredRtt = _kindBand - 1;
+
   int get preferenceScore {
-    final kindWeight = kind == LinkKind.lan ? 0 : 1000000;
-    final rttWeight = rtt?.inMilliseconds ?? 999999;
+    final kindWeight = kind == LinkKind.lan ? 0 : _kindBand;
+    final measured = rtt?.inMilliseconds;
+    final rttWeight = measured == null
+        ? _unmeasuredRtt
+        : measured.clamp(0, _unmeasuredRtt - 1);
     return kindWeight + rttWeight;
   }
 }

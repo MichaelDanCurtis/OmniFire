@@ -74,4 +74,47 @@ void main() {
     await p.a.close();
     expect(p.a.state, LinkState.disconnected);
   });
+
+  test('two connected pairs yield four distinct ids', () {
+    final first = FakeLink.connectedPair();
+    final second = FakeLink.connectedPair();
+    final ids = {first.a.id, first.b.id, second.a.id, second.b.id};
+    expect(ids, hasLength(4));
+  });
+
+  test('explicit ids override the generated ones', () {
+    final p = FakeLink.connectedPair(idA: 'left', idB: 'right');
+    expect(p.a.id, 'left');
+    expect(p.b.id, 'right');
+  });
+
+  test('close is idempotent', () async {
+    final p = FakeLink.connectedPair();
+    await p.a.close();
+    await p.a.close();
+    expect(p.a.state, LinkState.disconnected);
+  });
+
+  test('sending to a closed peer surfaces LinkClosedError, not StateError',
+      () async {
+    final p = FakeLink.connectedPair();
+    await p.b.close();
+    await expectLater(
+      p.a.send(utf8.encode('orphan')),
+      throwsA(isA<LinkClosedError>()),
+    );
+  });
+
+  test('deliver after close does not throw', () async {
+    final p = FakeLink.connectedPair();
+    await p.a.close();
+    expect(() => p.a.deliver(utf8.encode('late')), returnsNormally);
+  });
+
+  test('a link closed during a suspended send fails that send', () async {
+    final p = FakeLink.connectedPair();
+    final pending = p.a.send(utf8.encode('inflight'));
+    await p.a.close();
+    await expectLater(pending, throwsA(isA<LinkClosedError>()));
+  });
 }

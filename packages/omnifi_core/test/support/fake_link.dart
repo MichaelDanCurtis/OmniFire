@@ -30,6 +30,11 @@ class FakeLink implements Link {
   FakeLink? _peer;
   LinkState _state = LinkState.connected;
   bool _failNextSend = false;
+  bool _closed = false;
+
+  /// Set when the link this one was wired to has closed. A write into a peer
+  /// that has gone away is a dead socket, not a silent success.
+  bool _peerClosed = false;
 
   @override
   Stream<Uint8List> get inbound => _inbound.stream;
@@ -43,7 +48,10 @@ class FakeLink implements Link {
   @override
   LinkQuality get quality => LinkQuality(kind: kind, rtt: _rtt);
 
+  /// No-op once closed: a closed link has no state left to publish, and the
+  /// underlying controller would throw.
   void setState(LinkState next) {
+    if (_closed) return;
     _state = next;
     _states.add(next);
   }
@@ -52,16 +60,25 @@ class FakeLink implements Link {
   void failNextSend() => _failNextSend = true;
 
   /// Pushes a frame onto this link's inbound stream as though it arrived
-  /// from the network.
-  void deliver(List<int> frame) => _inbound.add(Uint8List.fromList(frame));
+  /// from the network. No-op once closed.
+  void deliver(List<int> frame) {
+    if (_closed) return;
+    _inbound.add(Uint8List.fromList(frame));
+  }
 
+  /// Models a real socket write: it suspends, and the link may die while it
+  /// is suspended.
   @override
   Future<void> send(List<int> frame) async {
-    if (_state != LinkState.connected) {
+    if (_state != LinkState.connected || _closed) {
       throw LinkClosedError(id);
     }
     if (_failNextSend) {
       _failNextSend = false;
+      throw LinkClosedError(id);
+    }
+    await Future<void>.delayed(Duration.zero);
+    if (_state != LinkState.connected || _closed || _peerClosed) {
       throw LinkClosedError(id);
     }
     sent.add(Uint8List.fromList(frame));
@@ -70,16 +87,32 @@ class FakeLink implements Link {
 
   @override
   Future<void> close() async {
-    setState(LinkState.disconnected);
+    if (_closed) return;
+    _closed = true;
+    _state = LinkState.disconnected;
+    _states.add(LinkState.disconnected);
+    final peer = _peer;
+    _peer = null;
+    if (peer != null && identical(peer._peer, this)) {
+      peer._peer = null;
+      peer._peerClosed = true;
+    }
     await _inbound.close();
     await _states.close();
   }
 
+  static int _pairCounter = 0;
+
+  /// Each pair gets distinct ids so that several pairs can coexist in one
+  /// test without colliding in anything that keys links by [id].
   static ({FakeLink a, FakeLink b}) connectedPair({
     LinkKind kind = LinkKind.lan,
+    String? idA,
+    String? idB,
   }) {
-    final a = FakeLink(id: 'fake-a', kind: kind);
-    final b = FakeLink(id: 'fake-b', kind: kind);
+    final n = ++_pairCounter;
+    final a = FakeLink(id: idA ?? 'fake-a-$n', kind: kind);
+    final b = FakeLink(id: idB ?? 'fake-b-$n', kind: kind);
     a._peer = b;
     b._peer = a;
     return (a: a, b: b);
