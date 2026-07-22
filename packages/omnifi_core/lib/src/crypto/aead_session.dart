@@ -55,14 +55,18 @@ class AeadSession {
 
   Future<Uint8List> seal(List<int> plaintext,
       {List<int> aad = const []}) async {
-    final counter = _sendCounter;
+    // Reserve the counter synchronously, before the first suspension point.
+    // Reading it and incrementing after the await would let two concurrent
+    // seals encrypt under an identical nonce, which is fatal for
+    // ChaCha20-Poly1305. `_sendCounter++` contains no await, so on a
+    // single-threaded isolate the reservation is atomic w.r.t. the event loop.
+    final counter = _sendCounter++;
     final box = await _algorithm.encrypt(
       plaintext,
       secretKey: _sendKey,
       nonce: _nonceFor(counter),
       aad: aad,
     );
-    _sendCounter++;
 
     final out = Uint8List(counterBytes + box.cipherText.length + macBytes);
     ByteData.view(out.buffer).setUint64(0, counter);
@@ -82,6 +86,7 @@ class AeadSession {
     final counter = ByteData.view(bytes.buffer, bytes.offsetInBytes)
         .getUint64(0);
 
+    // Cheap fast path: reject an obvious replay before paying for decryption.
     if (counter <= _lastAcceptedReceiveCounter) {
       throw ReplayError(counter, _lastAcceptedReceiveCounter);
     }
@@ -99,6 +104,15 @@ class AeadSession {
       );
     } on SecretBoxAuthenticationError {
       throw const DecryptionError('authentication failed');
+    }
+
+    // Re-check after the suspension: a concurrent open() of the same frame
+    // may have committed while we were awaiting decryption. Committing only
+    // after successful authentication is what stops an unauthenticated
+    // attacker from advancing the window, so the guard has to be repeated
+    // here rather than moved earlier.
+    if (counter <= _lastAcceptedReceiveCounter) {
+      throw ReplayError(counter, _lastAcceptedReceiveCounter);
     }
 
     _lastAcceptedReceiveCounter = counter;
