@@ -2,6 +2,8 @@
 library omnifi_core;
 
 export 'src/version.dart';
+export 'src/identity/device_identity.dart';
+export 'src/identity/secure_store.dart';
 export 'src/crypto/aead_session.dart';
 export 'src/crypto/handshake.dart';
 export 'src/crypto/sas.dart';
