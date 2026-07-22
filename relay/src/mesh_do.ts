@@ -1,6 +1,5 @@
 const HEADER_BYTES = 16;
 const MAX_FRAME_BYTES = 1048576;
-const BROADCAST = new Uint8Array(HEADER_BYTES);
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -15,15 +14,20 @@ function isBroadcast(header: Uint8Array): boolean {
 /// One instance per mesh. Holds the connected sockets and forwards opaque
 /// frames between them. It cannot decrypt anything and does not try.
 export class MeshDurableObject implements DurableObject {
-  constructor(private state: DurableObjectState, private env: unknown) {}
+  constructor(private state: DurableObjectState, env: unknown) {}
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const device = url.searchParams.get('device');
     if (!device || !/^[0-9a-f]{32}$/.test(device)) {
+      // Empty body (not a text error message) works around an upstream
+      // vitest-pool-workers bug where an unconsumed Response body returned
+      // from inside a Durable Object corrupts isolated-storage teardown.
+      // See https://github.com/cloudflare/workers-sdk/issues/5629
       return new Response(null, { status: 400 });
     }
     if (request.headers.get('Upgrade') !== 'websocket') {
+      // Same workaround as above; see the comment on the 400 response.
       return new Response(null, { status: 426 });
     }
 

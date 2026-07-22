@@ -1,4 +1,4 @@
-import { env, SELF } from 'cloudflare:test';
+import { SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 
 const MESH = 'a'.repeat(32);
