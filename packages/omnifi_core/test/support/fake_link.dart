@@ -32,10 +32,6 @@ class FakeLink implements Link {
   bool _failNextSend = false;
   bool _closed = false;
 
-  /// Set when the link this one was wired to has closed. A write into a peer
-  /// that has gone away is a dead socket, not a silent success.
-  bool _peerClosed = false;
-
   @override
   Stream<Uint8List> get inbound => _inbound.stream;
 
@@ -78,7 +74,11 @@ class FakeLink implements Link {
       throw LinkClosedError(id);
     }
     await Future<void>.delayed(Duration.zero);
-    if (_state != LinkState.connected || _closed || _peerClosed) {
+    // No separate peer-closed check needed: close() closes both ends of a
+    // pair synchronously (see below), so a peer that has gone away has
+    // already flipped this link's own `_closed` by the time send() can
+    // observe it.
+    if (_state != LinkState.connected || _closed) {
       throw LinkClosedError(id);
     }
     sent.add(Uint8List.fromList(frame));
@@ -95,11 +95,14 @@ class FakeLink implements Link {
     _peer = null;
     if (peer != null && identical(peer._peer, this)) {
       peer._peer = null;
-      peer._peerClosed = true;
       // A closed socket is closed at both ends. The remote end sees end-of-
       // stream on its reads and goes disconnected; it does not sit connected
       // on a channel with nothing on the other side. Recursion terminates
-      // because the peer's own `_peer` has already been cleared.
+      // because the peer's own `_peer` has already been cleared. This runs
+      // synchronously up to the point where the peer's own `_closed` flag
+      // flips, so by the time this call returns the peer's `send()` will
+      // already refuse on its own `_closed` guard -- no separate
+      // peer-closed flag is needed for that.
       await peer.close();
     }
     await _inbound.close();
@@ -121,5 +124,32 @@ class FakeLink implements Link {
     a._peer = b;
     b._peer = a;
     return (a: a, b: b);
+  }
+}
+
+/// Wraps a [Link] so that [close] always throws, simulating a transport
+/// that fails to tear down cleanly. Everything else delegates to [inner].
+class ThrowingCloseLink implements Link {
+  ThrowingCloseLink(this.inner);
+  final Link inner;
+
+  @override
+  String get id => inner.id;
+  @override
+  LinkKind get kind => inner.kind;
+  @override
+  Stream<Uint8List> get inbound => inner.inbound;
+  @override
+  Stream<LinkState> get states => inner.states;
+  @override
+  LinkState get state => inner.state;
+  @override
+  LinkQuality get quality => inner.quality;
+  @override
+  Future<void> send(List<int> frame) => inner.send(frame);
+
+  @override
+  Future<void> close() async {
+    throw StateError('close() failed on the transport');
   }
 }

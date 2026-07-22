@@ -157,18 +157,35 @@ class PairingFlow {
         sas: sas,
         confirm: (userConfirmed) async {
           if (!userConfirmed) {
-            // Declining is not a local decision. The short authentication
-            // string exists to expose a man-in-the-middle, and in that attack
-            // the user is looking at two screens that disagree: whichever one
-            // they decline on, the *other* flow is still live and would pair
-            // with the attacker if confirmed. Tearing the channel down is
-            // what makes the defence two-sided. It needs no wire message —
-            // and deliberately uses none, since a decline frame sent on this
-            // raw, pre-session link would be unauthenticated and so forgeable
-            // by the very attacker it is meant to stop. A closed link cannot
-            // be forged, only withheld, and withholding it is what an
-            // attacker already has to work with.
-            await link.close();
+            // Declining tears down the channel. On a direct link between the
+            // two honest parties, or against an attacker relaying a single
+            // channel, this closes the pairing outright: there is nothing
+            // left for the other side to confirm against. It does NOT
+            // generalize to a real man-in-the-middle running two separate
+            // channels (this device <-> attacker <-> peer): closing our
+            // A<->M leg cannot close the attacker's M<->B leg, and the
+            // attacker is free to withhold whatever signal it likes from B
+            // regardless of what we do here. Nor can it help at all once the
+            // peer has already run `confirm(true)` to completion -- that
+            // side is done, and revoking it would need a revocation frame,
+            // which the no-new-wire-frame constraint for this exchange
+            // deliberately forbids. This is still the right and only thing
+            // this layer can do: it needs no wire message -- and
+            // deliberately uses none, since a decline frame sent on this
+            // raw, pre-session link would be unauthenticated and so
+            // forgeable by the very attacker it is meant to stop. A closed
+            // link cannot be forged, only withheld, and withholding it is
+            // what an attacker already has to work with.
+            //
+            // Closing is best-effort: a decline must be reported as a
+            // decline even if the transport fails to close cleanly, so a
+            // thrown LinkClosedError (or anything else) from close() here
+            // must not escape in place of PairingRejectedError.
+            try {
+              await link.close();
+            } on Object {
+              // Ignored: see above.
+            }
             throw const PairingRejectedError(
                 'user reported the authentication words did not match');
           }

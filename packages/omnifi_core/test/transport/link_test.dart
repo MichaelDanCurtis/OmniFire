@@ -95,8 +95,13 @@ void main() {
     expect(p.a.state, LinkState.disconnected);
   });
 
-  test('sending to a closed peer surfaces LinkClosedError, not StateError',
-      () async {
+  test(
+      'closing one end of a pair closes the other, so sending on it '
+      'surfaces LinkClosedError, not StateError', () async {
+    // close() closes both ends of a connected pair (see FakeLink.close), so
+    // this exercises `a`'s own `_closed` guard in send() -- reached because
+    // closing `b` recursively closed `a` too -- rather than any state
+    // specific to "the peer, not me, is what closed".
     final p = FakeLink.connectedPair();
     await p.b.close();
     await expectLater(

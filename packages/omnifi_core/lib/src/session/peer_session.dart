@@ -220,6 +220,11 @@ class PeerSession {
   Future<void> _flush() => _serialized(_flushLocked);
 
   Future<void> _flushLocked() async {
+    // A flush can already be queued on the outbound chain (retry timer,
+    // link-states listener, or attach) at the moment dispose() runs. Once
+    // disposed, this session owns no link and must not write queued frames
+    // to whatever link happened to be current when it was scheduled.
+    if (_disposed) return;
     final start = _link;
     if (start == null || start.state != LinkState.connected) return;
     final entries = _outbox.drain();
@@ -327,6 +332,12 @@ class PeerSession {
     _linkSub = null;
     await _stateSub?.cancel();
     _stateSub = null;
+    // Disposed means disposed: this session no longer owns a link. A flush
+    // already queued on _outboundTail (from the retry timer, the
+    // link-states listener, or attach) is stopped by the _disposed guard in
+    // _flushLocked, not by this becoming null, but nulling it here still
+    // makes the invariant hold for anything reading `link`/`_link` after.
+    _link = null;
     // Let any already-queued outbound action finish (it will refuse itself
     // via _throwIfDead) so nothing runs after the controllers are closed.
     await _outboundTail;

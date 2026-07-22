@@ -189,6 +189,31 @@ void main() {
     await joinerFails;
   });
 
+  test(
+      'declining still reports PairingRejectedError when the link fails to '
+      'close', () async {
+    final inviter = await identity('Mac');
+    final joiner = await identity('PC');
+    final mesh = Mesh(meshId: 'a' * 32);
+    final links = FakeLink.connectedPair();
+    final throwingA = ThrowingCloseLink(links.a);
+    final invite = generateInvite(
+        meshId: mesh.meshId, inviterPublicKey: inviter.keys.publicKey);
+
+    final aPending = PairingFlow.invite(
+        identity: inviter, mesh: mesh, invite: invite, link: throwingA);
+    final bPending =
+        PairingFlow.join(identity: joiner, invite: invite, link: links.b);
+    final a = await aPending;
+    final b = await bPending;
+
+    // link.close() is best-effort on decline: a transport failure while
+    // tearing down the channel must still surface as PairingRejectedError,
+    // not as the raw exception from close().
+    await expectLater(a.confirm(false), throwsA(isA<PairingRejectedError>()));
+    expect(b.sas, a.sas);
+  });
+
   test('a wrong PSK produces a different SAS on each side', () async {
     final inviter = await identity('Mac');
     final joiner = await identity('PC');

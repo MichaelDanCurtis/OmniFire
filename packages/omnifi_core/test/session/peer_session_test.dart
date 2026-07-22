@@ -671,6 +671,84 @@ void main() {
     expect(s.a.link, isNull);
   });
 
+  test(
+      'a second write failure before the first retry fires cancels it, '
+      'leaving only one outstanding retry', () async {
+    final s = sessionPair();
+    final links = DelayedLink.pair();
+    // Attempt 0 (the initial direct-dispatch send) and attempt 1 (triggered
+    // below by a synthetic in-place-reconnect event) both fail; attempt 2
+    // succeeds.
+    links.a.failAt.addAll([0, 1]);
+    s.b.attach(links.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+    final errors = <Object>[];
+    s.a.errors.listen(errors.add);
+
+    s.a.attach(links.a);
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'retry-race'});
+    expect(s.a.queuedFrameCount, 1);
+    // A retry timer is now armed, ~outboundRetryDelay from now (t0).
+
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    // A second, independent trigger for a flush -- exactly what the
+    // link-states listener produces on an in-place reconnect -- fails
+    // again. If _onWriteFailure correctly cancels the outstanding timer
+    // before arming a new one, only the *new* timer (armed here, firing
+    // ~outboundRetryDelay from now) can ever deliver the frame. If it does
+    // not cancel, the stale first timer -- unaware this second failure
+    // already consumed attempt 1 -- would still fire at its original mark
+    // (~outboundRetryDelay after t0) and succeed early, since by then the
+    // only remaining failing attempt has already been spent.
+    links.a.setState(LinkState.connected);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(errors.length, 2);
+    expect(s.a.queuedFrameCount, 1);
+
+    // Past where an uncancelled first timer would have fired and succeeded
+    // (t0 + outboundRetryDelay), but still short of where the single
+    // correctly-rescheduled timer fires (second failure + outboundRetryDelay).
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(s.a.queuedFrameCount, 1,
+        reason: 'must not be delivered by a leftover, uncancelled first '
+            'retry timer');
+
+    // Past where the single correctly-rescheduled timer fires.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(s.a.queuedFrameCount, 0);
+    expect(seen.map((e) => e.payload['text']).toList(), ['retry-race']);
+    expect(errors.length, 2);
+  });
+
+  test(
+      'a retry armed before dispose does not fire on the already-attached '
+      'link', () async {
+    final s = sessionPair();
+    final links = DelayedLink.pair();
+    links.a.failAt.add(0);
+    s.b.attach(links.b);
+    final seen = <Envelope>[];
+    s.b.inbound.listen(seen.add);
+
+    // Unlike "attach after dispose does not resurrect the session", this
+    // link is not fresh: it is the very link already in use, with a retry
+    // timer already armed on it, at the moment dispose() runs.
+    s.a.attach(links.a);
+    await s.a.send(MessageType.clipboardUpdate, {'text': 'never lands'});
+    expect(s.a.queuedFrameCount, 1);
+
+    await s.a.dispose();
+    expect(s.a.link, isNull);
+
+    await Future<void>.delayed(
+        PeerSession.outboundRetryDelay + const Duration(milliseconds: 200));
+
+    expect(links.a.sent, isEmpty);
+    expect(seen, isEmpty);
+    expect(s.a.queuedFrameCount, 1);
+  });
+
   test('a stale link stream error is not emitted after migration', () async {
     final s = sessionPair();
     final first = LaggyCancelLink('laggy-first');
