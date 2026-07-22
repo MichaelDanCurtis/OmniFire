@@ -5670,11 +5670,13 @@ class RelayLink implements Link {
         (channelFactory ?? WebSocketChannel.connect)(uri);
     await channel.ready.timeout(timeout);
     return RelayLink._(
-      // The host is part of the id because two relay backends (Cloudflare
-      // and ARC) can be dialed for the same peer simultaneously. A bare
-      // 'relay:<peer>' would collide in LinkManager's candidate map and
-      // one backend would silently evict the other.
-      id: 'relay:${relayBase.host}:$peerDeviceId',
+      // Host AND port, because two relay backends can be dialed for the same
+      // peer simultaneously and LinkManager keys its candidate map by id. A
+      // bare 'relay:<peer>' collides across backends; host alone still
+      // collides for two relays on one host at different ports, which is
+      // exactly the local dev setup (localhost:8787 and localhost:8788).
+      // Uri.port returns the scheme default when absent, so this stays stable.
+      id: 'relay:${relayBase.host}:${relayBase.port}:$peerDeviceId',
       channel: channel,
       peerDeviceId: peerDeviceId,
     );
