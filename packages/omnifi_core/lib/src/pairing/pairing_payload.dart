@@ -129,7 +129,11 @@ PairingInvite decodeInviteUri(String uri) {
     meshId: meshId,
     inviterPublicKey: decode(key, 'public key'),
     psk: decode(psk, 'psk'),
-    relayHint: parsed.queryParameters['r'],
+    // Read from the guarded local, not `parsed.queryParameters` again. A second
+    // access is inert only because `Uri.queryParameters` is pure and
+    // deterministic, so it would rethrow what the guard above already caught —
+    // safety by accident, which a refactor could remove without warning.
+    relayHint: queryParameters['r'],
   );
 }
 
