@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<!-- Inbound: OmniFiEngine binds a LAN listener so a peer on the same
+	     network can connect directly instead of via the relay. Flutter's
+	     template already grants this in Debug for the VM service. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- Outbound: every relay in EngineConfig.relayBases is dialed as a
+	     WebSocket, and LAN peers are dialed directly. Without this the
+	     sandbox blocks both and the app builds, launches and silently never
+	     connects to anything. Not in Flutter's template. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>
