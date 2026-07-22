@@ -51,12 +51,16 @@ Future<DeviceIdentity> loadOrCreateIdentity({
   final existingPriv = await store.read(_kPrivateKey);
   final existingPub = await store.read(_kPublicKey);
 
-  if (existingId != null && existingPriv != null && existingPub != null) {
+  final presentCount = [existingId, existingPriv, existingPub]
+      .where((v) => v != null)
+      .length;
+
+  if (presentCount == 3) {
     final List<int> priv;
     final List<int> pub;
     try {
-      priv = base64Decode(existingPriv);
-      pub = base64Decode(existingPub);
+      priv = base64Decode(existingPriv!);
+      pub = base64Decode(existingPub!);
     } on FormatException {
       throw const IdentityError('stored key material is not valid base64');
     }
@@ -65,9 +69,22 @@ Future<DeviceIdentity> loadOrCreateIdentity({
     }
     await store.write(_kDisplayName, displayName);
     return DeviceIdentity(
-      deviceId: existingId,
+      deviceId: existingId!,
       displayName: displayName,
       keys: StaticKeyPair(publicKey: pub, privateKey: priv),
+    );
+  }
+
+  if (presentCount != 0) {
+    throw const IdentityError(
+      'stored identity is incomplete: one or more of '
+      'omnifi.identity.deviceId, omnifi.identity.privateKey, '
+      'omnifi.identity.publicKey is missing while at least one other is '
+      'present. Regenerating a fresh identity would silently orphan this '
+      'device from every peer it has already paired with. To recover, '
+      'restore the missing keychain entry from a backup if possible; '
+      'otherwise delete all of the omnifi.identity.* keys to deliberately '
+      're-pair this device as new.',
     );
   }
 

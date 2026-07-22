@@ -62,4 +62,52 @@ void main() {
       throwsA(isA<IdentityError>()),
     );
   });
+
+  test(
+      'device ID present, private key missing throws IdentityError instead '
+      'of regenerating', () async {
+    final store = InMemorySecureStore();
+    await loadOrCreateIdentity(store: store, displayName: 'A');
+    await store.delete('omnifi.identity.privateKey');
+    expect(
+      () => loadOrCreateIdentity(store: store, displayName: 'A'),
+      throwsA(isA<IdentityError>().having(
+        (e) => e.toString(),
+        'message',
+        contains('incomplete'),
+      )),
+    );
+  });
+
+  test(
+      'device ID present, public key missing throws IdentityError instead '
+      'of regenerating', () async {
+    final store = InMemorySecureStore();
+    await loadOrCreateIdentity(store: store, displayName: 'A');
+    await store.delete('omnifi.identity.publicKey');
+    expect(
+      () => loadOrCreateIdentity(store: store, displayName: 'A'),
+      throwsA(isA<IdentityError>().having(
+        (e) => e.toString(),
+        'message',
+        contains('incomplete'),
+      )),
+    );
+  });
+
+  test(
+      'private and public keys present, device ID missing throws '
+      'IdentityError instead of regenerating', () async {
+    final store = InMemorySecureStore();
+    await loadOrCreateIdentity(store: store, displayName: 'A');
+    await store.delete('omnifi.identity.deviceId');
+    expect(
+      () => loadOrCreateIdentity(store: store, displayName: 'A'),
+      throwsA(isA<IdentityError>().having(
+        (e) => e.toString(),
+        'message',
+        contains('incomplete'),
+      )),
+    );
+  });
 }
