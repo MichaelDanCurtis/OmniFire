@@ -12,3 +12,4 @@ export 'src/crypto/wordlist.dart';
 export 'src/protocol/framing.dart';
 export 'src/protocol/envelope.dart';
 export 'src/protocol/messages.dart';
+export 'src/transport/link.dart';
