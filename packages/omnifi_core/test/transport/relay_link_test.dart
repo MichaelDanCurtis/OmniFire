@@ -19,8 +19,9 @@ class FakeChannel extends StreamChannelMixin<Object?>
   void deliver(Object? message) => _incoming.add(message);
 
   /// Simulates the relay closing the socket with [code], e.g. 1009 when a
-  /// frame exceeded the 1 MiB limit.
-  Future<void> deliverClose(int code) async {
+  /// frame exceeded the 1 MiB limit, or `null` to simulate a close that
+  /// carries no code at all.
+  Future<void> deliverClose(int? code) async {
     _closeCode = code;
     await _incoming.close();
   }
@@ -153,6 +154,56 @@ class _HangingSink2 implements WebSocketSink {
   Future<void> close([int? closeCode, String? closeReason]) async {
     _channel.sinkClosed = true;
   }
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// A channel whose handshake never completes, like [_HangingChannel], but
+/// whose sink also never finishes closing.
+///
+/// Exists to prove `connect()` does not hang waiting on `sink.close()`
+/// while unwinding a handshake failure. The first (broken) fix attempt
+/// awaited `channel.sink.close()` before rethrowing: that passed every
+/// other test in this file (every other fake's `close()` resolves on its
+/// own) and then hung forever against the real relay, because the
+/// channel's local side is never wired up to consume a close when `ready`
+/// fails before a socket exists. This fake's `close()` never completes, so
+/// it reproduces that condition deterministically.
+class _HangingCloseChannel extends StreamChannelMixin<Object?>
+    implements WebSocketChannel {
+  final StreamController<Object?> _incoming =
+      StreamController<Object?>.broadcast();
+
+  @override
+  Stream<Object?> get stream => _incoming.stream;
+
+  @override
+  WebSocketSink get sink => _HangingCloseSink();
+
+  @override
+  int? get closeCode => null;
+
+  @override
+  String? get closeReason => null;
+
+  @override
+  String? get protocol => null;
+
+  @override
+  Future<void> get ready => Completer<void>().future;
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _HangingCloseSink implements WebSocketSink {
+  @override
+  void add(Object? data) {}
+
+  @override
+  Future<void> close([int? closeCode, String? closeReason]) =>
+      Completer<void>().future;
 
   @override
   noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
@@ -388,10 +439,34 @@ void main() {
       expect(stopwatch.elapsedMilliseconds, lessThan(2000));
       expect(fake.sinkClosed, isTrue);
     });
+
+    test(
+        'throws promptly rather than hanging when sink.close() never '
+        'completes', () async {
+      // Regression test for the first (broken) fix attempt, which awaited
+      // `channel.sink.close()` before rethrowing -- see
+      // _HangingCloseChannel's doc comment for why that hung against a
+      // real relay despite passing every other test here. Bounded with an
+      // outer timeout so a regression is a clean failure, not a stalled
+      // suite.
+      final fake = _HangingCloseChannel();
+      await expectLater(
+        RelayLink.connect(
+          relayBase: Uri.parse('http://localhost:8787'),
+          meshId: 'a' * 32,
+          localDeviceId: '1' * 32,
+          peerDeviceId: '2' * 32,
+          timeout: const Duration(milliseconds: 20),
+          channelFactory: (_) => fake,
+        ),
+        throwsA(anything),
+      ).timeout(const Duration(seconds: 2));
+    });
   });
 
   group('abnormal close', () {
-    test('an ordinary close (no code) reports disconnected', () async {
+    test('an explicit normal-closure close (code 1000) reports disconnected',
+        () async {
       final fake = FakeChannel();
       final link = await RelayLink.connect(
         relayBase: Uri.parse('http://localhost:8787'),
@@ -406,6 +481,27 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 10));
       expect(link.state, LinkState.disconnected);
       expect(link.closeCode, 1000);
+      expect(states, [LinkState.disconnected]);
+    });
+
+    test('a close with no code at all also reports disconnected', () async {
+      // Exercises the `code == null` half of the close-code mapping's
+      // `code == null || code == ws_status.normalClosure` check -- the
+      // explicit-1000 test above only ever reaches the second half.
+      final fake = FakeChannel();
+      final link = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8787'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => fake,
+      );
+      final states = <LinkState>[];
+      link.states.listen(states.add);
+      await fake.deliverClose(null);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(link.state, LinkState.disconnected);
+      expect(link.closeCode, isNull);
       expect(states, [LinkState.disconnected]);
     });
 

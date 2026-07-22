@@ -156,19 +156,45 @@ class LanListener {
       // the port and the address. LinkManager keys its candidate map
       // directly by link id with no collision check, so an id collision
       // would silently overwrite one candidate and leak its socket.
+      //
+      // Not covered by a test: the failure mode this defends against is two
+      // peers at DIFFERENT addresses independently picking the SAME port,
+      // but two live sockets a test process opens to one destination are
+      // guaranteed distinct source ports by the OS -- a real-socket test
+      // can only ever vary the port, never the address, so it would pass
+      // identically whether or not the address were part of the id. A test
+      // that claimed to cover this was removed for exactly that reason;
+      // this property (address-and-port together disambiguate; either
+      // alone does not) is verified by inspection instead.
       final link = await LanLink.fromSocket(
         socket,
         peerDeviceId:
             'pending-${socket.remoteAddress.address}-${socket.remotePort}',
       );
       if (_closed) {
-        // close() ran while this callback was suspended at the await
-        // above: cancelling a subscription does not retract an event
-        // already dispatched into a suspended async callback, so this
-        // connection can still resume after _incoming was closed. Adding
-        // to a closed StreamController throws StateError, and dropping the
-        // link here without closing it would leak its socket -- neither
-        // caller nor any listener is coming for it now, so dispose of it.
+        // Hazard this guards against: close() ran while this callback was
+        // suspended at the await above. Cancelling a subscription does not
+        // retract an event already dispatched into a suspended async
+        // callback, so this connection can still resume after _incoming
+        // was closed. Adding to a closed StreamController throws
+        // StateError, and dropping the link here without closing it would
+        // leak its socket -- neither caller nor any listener is coming for
+        // it now, so dispose of it instead.
+        //
+        // This check-then-act is only correct because close() (below)
+        // sets _closed synchronously, before its first await -- so any
+        // accept callback resuming after close() has run is guaranteed to
+        // observe it true here. That ordering is load-bearing; do not
+        // reorder it.
+        //
+        // Load-bearing, verified by inspection rather than by a test: the
+        // window is exactly one microtask wide, and dart:io drains its
+        // whole accept backlog synchronously per native callback, so real
+        // timing never lands in it. Forcing it deterministically would mean
+        // coupling a test to how many microtasks LanLink's constructor
+        // happens to schedule internally -- not a contract worth pinning a
+        // test to (a prior attempt at exactly that self-deadlocked on
+        // neighbouring slots and was removed).
         await link.close();
         return;
       }
@@ -196,10 +222,23 @@ class LanListener {
   Stream<LanLink> get incoming => _incoming.stream;
 
   Future<void> close() async {
-    // Set before any await: an accept callback already suspended at the
-    // `await LanLink.fromSocket(...)` above resumes on a later microtask no
-    // matter what we do to the subscription below, and must see this flag
-    // updated by then.
+    // Hazard this ordering guards against: an accept callback can already
+    // be suspended at the `await LanLink.fromSocket(...)` in the
+    // constructor above when close() runs, and it resumes on a later
+    // microtask no matter what we do to the subscription below -- so
+    // without this flag, it could add a link to _incoming after this
+    // method has closed it.
+    //
+    // Set before any await, deliberately: that resumed callback's
+    // `if (_closed)` check (above) is only guaranteed to observe this flag
+    // if it is set synchronously, before close() itself suspends. Moving
+    // this assignment after an await would reopen the race.
+    //
+    // Verified by inspection rather than by a test, deliberately: the
+    // window is one microtask wide and unreachable via real timing (see
+    // the accept callback's comment above), so a test would have to
+    // intercept LanListener's constructor-internal microtask count to
+    // force it -- not a contract worth coupling a test to.
     _closed = true;
     await _sub?.cancel();
     await _server.close();
