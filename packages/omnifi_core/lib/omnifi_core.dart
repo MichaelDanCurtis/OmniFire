@@ -14,5 +14,6 @@ export 'src/protocol/envelope.dart';
 export 'src/protocol/messages.dart';
 export 'src/transport/link.dart';
 export 'src/transport/outbox.dart';
+export 'src/transport/link_manager.dart';
 export 'src/session/peer_session.dart';
 export 'src/pairing/pairing_payload.dart';
