@@ -17,6 +17,20 @@ Future<void> pump() async {
   }
 }
 
+/// Polls until [done], for the tests whose subject is a real [Timer] firing.
+Future<void> pumpUntil(
+  bool Function() done, {
+  Duration timeout = const Duration(seconds: 5),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!done()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw StateError('condition was not met within $timeout');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+}
+
 /// A [Link] that records how often it was closed and tolerates a double
 /// close, so a test can tell whether the manager disposed of it. Local to
 /// this file: the shared [FakeLink] is depended on by other suites.
@@ -381,6 +395,145 @@ void main() {
       m.offer(FakeLink(id: 'lan', kind: LinkKind.lan));
       await m.stop();
       expect(m.status, ConnectionStatus.offline);
+    });
+
+    test('offering a link with no session yet reports reconnecting rather '
+        'than throwing', () async {
+      // The engine constructs a manager without a session and assigns one
+      // from inside its dialer. offer() is synchronous and is called from
+      // inside an unawaited .then, so a LateInitializationError out of
+      // _selectBest would surface as an unhandled async error -- with the
+      // link left in _candidates, never attached, never closed, and the
+      // status never updated.
+      final m = LinkManager(dialers: const [], clock: testClock);
+      await m.start();
+      final orphan = FakeLink(id: 'lan', kind: LinkKind.lan);
+      expect(() => m.offer(orphan), returnsNormally);
+      expect(m.status, ConnectionStatus.reconnecting);
+      expect(m.candidates.keys, ['lan']);
+      await m.stop();
+    });
+  });
+
+  // ---- The backoff must actually drive a redial ----
+
+  group('LinkManager retry', () {
+    test('redials on its own when the only candidate disconnects', () async {
+      final session = newSession();
+      final dialed = <_ControlledLink>[];
+      final m = LinkManager(
+        session: session,
+        dialers: [
+          () async {
+            final link = _ControlledLink(
+              id: 'dial-${dialed.length + 1}',
+              kind: LinkKind.relay,
+            );
+            dialed.add(link);
+            return link;
+          },
+        ],
+        clock: testClock,
+        backoff: BackoffPolicy(
+          base: const Duration(milliseconds: 10),
+          jitter: 0,
+        ),
+      );
+
+      await m.start();
+      await pumpUntil(() => session.link?.id == 'dial-1');
+
+      // The network drops. Nothing sleeps, nothing wakes, nobody calls
+      // onWake -- which used to be the only thing that ever redialed.
+      await dialed.first.close();
+
+      await pumpUntil(() => session.link?.id == 'dial-2');
+      expect(m.status, ConnectionStatus.connectedRelay);
+      await m.stop();
+    });
+
+    test('a failed dial is retried without a wake event', () async {
+      var dials = 0;
+      final m = LinkManager(
+        session: newSession(),
+        dialers: [
+          () async {
+            if (++dials == 1) throw StateError('connection refused');
+            return _ControlledLink(id: 'dial-$dials', kind: LinkKind.relay);
+          },
+        ],
+        clock: testClock,
+        backoff: BackoffPolicy(
+          base: const Duration(milliseconds: 10),
+          jitter: 0,
+        ),
+      );
+
+      await m.start();
+      await pumpUntil(() => m.status == ConnectionStatus.connectedRelay);
+      expect(dials, 2);
+      await m.stop();
+    });
+
+    test('several dialers failing together schedule one redial, not one each',
+        () async {
+      var dials = 0;
+      final m = LinkManager(
+        session: newSession(),
+        dialers: [
+          () async {
+            dials++;
+            throw StateError('refused');
+          },
+          () async {
+            dials++;
+            throw StateError('refused');
+          },
+        ],
+        clock: testClock,
+        backoff: BackoffPolicy(
+          base: const Duration(milliseconds: 50),
+          jitter: 0,
+        ),
+      );
+
+      await m.start();
+      // One retry round lands at 2*base = 100ms. A second, redundant timer
+      // armed by the second failure would land at 4*base = 200ms and dial
+      // both dialers again.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(dials, 4);
+      await m.stop();
+    });
+
+    test('a stopped manager performs no redial', () async {
+      var dials = 0;
+      final m = LinkManager(
+        session: newSession(),
+        dialers: [
+          () async {
+            dials++;
+            throw StateError('connection refused');
+          },
+        ],
+        clock: testClock,
+        backoff: BackoffPolicy(
+          base: const Duration(milliseconds: 10),
+          jitter: 0,
+        ),
+      );
+
+      await m.start();
+      await pump();
+      expect(dials, 1);
+
+      // The retry is armed by now. Stopping must cancel it, and it must not
+      // fire afterwards either.
+      await m.stop();
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(dials, 1);
+      expect(m.status, ConnectionStatus.offline);
+      expect(m.candidates, isEmpty);
     });
   });
 }

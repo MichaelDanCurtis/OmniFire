@@ -97,6 +97,39 @@ class GatedClipboardWatcher implements ClipboardWatcher {
   }
 }
 
+/// A [LanDiscovery] that runs a callback at two points [start] cannot
+/// otherwise be interrupted at.
+///
+/// [advertise] is called, and its body runs, strictly before [start] awaits
+/// it; [discover] is evaluated synchronously inside `LinkManager.start()`,
+/// which [start] calls from inside its per-peer loop. A hook that calls
+/// `stop()` from either therefore lands `_started = false` in exactly the
+/// window the guard after it exists for -- without counting microtasks.
+class HookedDiscovery implements LanDiscovery {
+  HookedDiscovery({this.onAdvertise, this.onDiscover});
+
+  final void Function()? onAdvertise;
+  final void Function()? onDiscover;
+  bool discovered = false;
+
+  @override
+  Stream<LanEndpoint> discover() {
+    if (!discovered) {
+      discovered = true;
+      onDiscover?.call();
+    }
+    return const Stream<LanEndpoint>.empty();
+  }
+
+  @override
+  Future<void> advertise({
+    required String deviceId,
+    required int port,
+  }) async {
+    onAdvertise?.call();
+  }
+}
+
 /// Wraps a [Link] so [close] suspends until released. Everything else
 /// delegates, so a manager tearing this down stalls exactly where a real
 /// socket close would.
@@ -445,6 +478,85 @@ void main() {
     await rebind.close();
   });
 
+  test('a stop landing inside the LAN bind closes the too-late listener',
+      () async {
+    // The test above resumes at the FIRST re-check, so nothing is ever bound
+    // and the bind guard is not what it proves. This one resumes after the
+    // bind has succeeded: the guard is the only thing standing between a
+    // stopped engine and a live ServerSocket nothing owns.
+    final probe = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
+    final port = probe.port;
+    await probe.close();
+
+    final e = await engine(engineConfig: config(lan: true, lanPort: port));
+    e.mesh.addPeer(placeholderPeer('b' * 32, 5));
+
+    final bound = Completer<LanListener>();
+    final release = Completer<void>();
+    e.debugBindListener = ({required String localDeviceId, int port = 0}) async {
+      final listener =
+          await LanListener.bind(localDeviceId: localDeviceId, port: port);
+      bound.complete(listener);
+      await release.future;
+      return listener;
+    };
+
+    final starting = e.start();
+    final listener = await bound.future;
+    expect(listener.port, port);
+
+    // Bound for real, and now handed to an engine that has already torn
+    // itself down.
+    final stopping = e.stop();
+    release.complete();
+    await starting;
+    await stopping;
+
+    expect(e.debugListenerPort, isNull);
+    expect(e.debugTrackedPeerIds, isEmpty);
+    expect(e.debugSubscriptionCount, 0);
+    // A listener the guard failed to close would still own this port.
+    final rebind = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+    await rebind.close();
+  });
+
+  test('a stop landing during the LAN advertise connects no peers', () async {
+    late OmniFiEngine e;
+    Future<void>? stopping;
+    final discovery =
+        HookedDiscovery(onAdvertise: () => stopping = e.stop());
+    e = await engine(engineConfig: config(lan: true, discovery: discovery));
+    e.mesh.addPeer(placeholderPeer('b' * 32, 5));
+
+    await e.start();
+    await stopping;
+
+    // The teardown ran with the maps empty. A peer connected after it would
+    // hold a manager and a status subscription nothing will ever stop.
+    expect(e.debugTrackedPeerIds, isEmpty);
+    expect(e.debugSubscriptionCount, 0);
+    expect(e.debugListenerPort, isNull);
+  });
+
+  test('a stop landing between two peers connects no further peers', () async {
+    late OmniFiEngine e;
+    Future<void>? stopping;
+    // Fires from inside the FIRST peer's dial, so the stop lands while the
+    // per-peer loop is suspended in _connectPeer and the second iteration is
+    // still to come.
+    final discovery = HookedDiscovery(onDiscover: () => stopping = e.stop());
+    e = await engine(engineConfig: config(lan: true, discovery: discovery));
+    e.mesh.addPeer(placeholderPeer('b' * 32, 5));
+    e.mesh.addPeer(placeholderPeer('c' * 32, 6));
+
+    await e.start();
+    await stopping;
+
+    expect(discovery.discovered, isTrue);
+    expect(e.debugTrackedPeerIds, isEmpty);
+    expect(e.debugSubscriptionCount, 0);
+  });
+
   // ---- Fix 5: forgetPeer must cancel that peer's subscriptions ----
 
   test("a forgotten peer's manager can no longer write into the status map",
@@ -513,6 +625,52 @@ void main() {
       contains(links.a.id),
     );
     expect(links.a.state, LinkState.connected);
+    await e.stop();
+  });
+
+  test('an inbound link is refused for a peer whose session is already live',
+      () async {
+    // An inbound socket carries no identity of its own, and a peer whose
+    // session is already live short-circuits the establisher -- so adopting
+    // one runs NO handshake at all. Because LAN outranks every relay, the
+    // adopted socket becomes the active link and the session migrates onto
+    // it: anyone who can reach the listener port black-holes the peer's
+    // traffic and, with one junk frame, kills the session.
+    final e = await engine();
+    final peerIdentity = await loadOrCreateIdentity(
+      store: InMemorySecureStore(),
+      displayName: 'Peer',
+    );
+    e.mesh.addPeer(rosterEntryFor(peerIdentity));
+    await e.start();
+
+    // The state a reconnected peer leaves behind: a live session carried by
+    // a relay link.
+    final session = e.debugAttachSession(
+      peerDeviceId: peerIdentity.deviceId,
+      crypto: AeadSession(
+        sendKey: List<int>.filled(32, 11),
+        receiveKey: List<int>.filled(32, 22),
+      ),
+    );
+    final manager = e.debugManagerFor(peerIdentity.deviceId)!;
+    manager.session = session;
+    final relay = FakeLinkFactory(id: 'relay-live', kind: LinkKind.relay);
+    manager.offer(relay);
+    expect(session.link?.id, 'relay-live');
+
+    // The attacker: a LAN socket with nobody on the far end. Nothing on it
+    // ever authenticates, because nothing on this path can.
+    final attack = FakeLinkFactory.connectedPair(
+      idA: 'attacker',
+      idB: 'attacker-far',
+    );
+    await e.debugAcceptInbound(attack.a);
+
+    expect(session.link?.id, 'relay-live');
+    expect(manager.candidates.keys, ['relay-live']);
+    expect(attack.a.state, LinkState.disconnected);
+    expect(attack.a.sent, isEmpty);
     await e.stop();
   });
 

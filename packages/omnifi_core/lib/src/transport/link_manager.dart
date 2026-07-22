@@ -43,7 +43,7 @@ class BackoffPolicy {
 /// best-ranked one, fails over on disconnect, and redials with backoff.
 class LinkManager {
   LinkManager({
-    PeerSession? session,
+    this.session,
     required List<Future<Link> Function()> dialers,
     required int Function() clock,
     BackoffPolicy? backoff,
@@ -51,23 +51,28 @@ class LinkManager {
     this.livenessTimeout = const Duration(seconds: 45),
   })  : _dialers = dialers,
         _clock = clock,
-        _backoff = backoff ?? BackoffPolicy() {
-    if (session != null) this.session = session;
-  }
+        _backoff = backoff ?? BackoffPolicy();
 
-  /// The session adopted links are attached to.
+  /// The session adopted links are attached to, or null until one exists.
   ///
-  /// Late-bound rather than required, because a real session's keys come from
-  /// a handshake, the handshake needs a link, and this manager is what
-  /// produces links. The engine therefore constructs the manager without a
-  /// session and assigns one from inside its dialer, strictly before that
-  /// dialer returns a link — and [offer] is the only path that reads it, so
-  /// no read can precede the assignment.
+  /// Nullable rather than required, because a real session's keys come from a
+  /// handshake, the handshake needs a link, and this manager is what produces
+  /// links. The engine therefore constructs the manager without a session and
+  /// assigns one from inside its dialer, strictly before that dialer returns
+  /// a link.
   ///
-  /// Reassignable for the same reason it is late: a decryption failure kills
-  /// a session permanently, and the replacement must be installed without
-  /// tearing down the manager that owns the connection to that peer.
-  late PeerSession session;
+  /// Nullable rather than `late`, because the single reader is [_selectBest],
+  /// reached synchronously from [offer] — which the engine calls from inside
+  /// an unawaited `.then`. A `LateInitializationError` there is not a visible
+  /// failure: it is an unhandled async error thrown into a dropped future,
+  /// leaving the offered link in [_candidates], never attached, never closed
+  /// and with the status never updated. [_selectBest] skips the attach and
+  /// reports [ConnectionStatus.reconnecting] instead.
+  ///
+  /// Reassignable because a decryption failure kills a session permanently,
+  /// and the replacement must be installed without tearing down the manager
+  /// that owns the connection to that peer.
+  PeerSession? session;
   final List<Future<Link> Function()> _dialers;
   final int Function() _clock;
   final BackoffPolicy _backoff;
@@ -91,6 +96,11 @@ class LinkManager {
   /// [offer], re-attaching the session and registering a subscription that the
   /// teardown's `clear()` then discards: an open link nobody tracks or closes.
   int _dialEpoch = 0;
+
+  /// The one outstanding redial, or null when none is armed. See
+  /// [_scheduleRetry]: exactly one at a time, cancelled on adoption and on
+  /// [stop], and epoch-guarded so it cannot resurrect a torn-down generation.
+  Timer? _retryTimer;
 
   ConnectionStatus get status => _status;
   Stream<ConnectionStatus> get statuses => _statuses.stream;
@@ -130,9 +140,37 @@ class LinkManager {
           // adopted, must not penalise a healthy connection.
           if (epoch != _dialEpoch || _active != null) return;
           _attempt++;
+          _scheduleRetry();
         },
       ));
     }
+  }
+
+  /// Arms the single outstanding redial, after [nextRetryDelay].
+  ///
+  /// This is the only thing that turns the backoff into recovery. Dials
+  /// otherwise happen just in [start] and [onWake], so before this existed a
+  /// link that dropped stayed dropped until the machine slept and woke.
+  ///
+  /// Bounded and cancellable by construction: at most one timer exists at a
+  /// time (several dialers failing in the same round arm one redial between
+  /// them, not one each), a successful adoption cancels it, and [stop]
+  /// cancels it before its first await. The epoch captured here is checked
+  /// again when it fires, so a redial armed before a teardown cannot dial on
+  /// behalf of a generation that no longer exists.
+  void _scheduleRetry() {
+    if (!_running || _retryTimer != null) return;
+    final epoch = _dialEpoch;
+    _retryTimer = Timer(nextRetryDelay(), () {
+      _retryTimer = null;
+      if (!_running || epoch != _dialEpoch) return;
+      unawaited(_dialAll());
+    });
+  }
+
+  void _cancelRetry() {
+    _retryTimer?.cancel();
+    _retryTimer = null;
   }
 
   /// Registers a newly available link. Adopted only if it outranks the
@@ -164,14 +202,30 @@ class LinkManager {
       _active = null;
       _setStatus(
           _running ? ConnectionStatus.reconnecting : ConnectionStatus.offline);
+      // The last candidate has gone. Nothing else redials — this is what
+      // makes a dropped network recover without a wake event.
+      _scheduleRetry();
+      return;
+    }
+
+    final target = session;
+    if (target == null) {
+      // Links but nothing to attach them to yet: the engine assigns the
+      // session from inside its dialer and attaches the link itself. Report
+      // it rather than throwing out of a synchronous offer() whose future
+      // nobody holds.
+      _setStatus(
+          _running ? ConnectionStatus.reconnecting : ConnectionStatus.offline);
       return;
     }
 
     final best = usable.first;
     if (_active?.id != best.id) {
       _active = best;
-      session.attach(best);
+      target.attach(best);
       _attempt = 0;
+      // A link is up: whatever redial was armed for its absence is moot.
+      _cancelRetry();
       _lastAckMs = _clock();
     }
     _setStatus(best.quality.isDirect
@@ -191,6 +245,9 @@ class LinkManager {
   /// down unconditionally instead of waiting out the liveness timeout.
   Future<void> onWake() async {
     _dialEpoch++;
+    // Superseded by the unconditional redial below; leaving it armed would
+    // put a second dial round on top of that one.
+    _cancelRetry();
     // Snapshot before suspending: a link disconnecting mid-teardown makes its
     // own listener mutate these maps, which would blow up an in-place
     // iteration with a ConcurrentModificationError.
@@ -218,6 +275,10 @@ class LinkManager {
   Future<void> stop() async {
     _running = false;
     _dialEpoch++;
+    // Cancelled before the first await, alongside the flag and the epoch, so
+    // a redial armed a moment ago can neither fire during this teardown nor
+    // after it.
+    _cancelRetry();
     final subs = _stateSubs.values.toList();
     final links = _candidates.values.toList();
     _stateSubs.clear();

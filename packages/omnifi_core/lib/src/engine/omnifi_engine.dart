@@ -202,7 +202,7 @@ class OmniFiEngine {
       // nulls `_listener`, so a stop() landing during this bind would leave a
       // live ServerSocket assigned to an engine that believes it is stopped,
       // with nothing left to close it.
-      final listener = await LanListener.bind(
+      final listener = await debugBindListener(
         localDeviceId: identity.deviceId,
         port: config.lanPort,
       );
@@ -245,10 +245,17 @@ class OmniFiEngine {
   /// [SessionEstablisher.establish] closes the link when it fails, so at most
   /// one candidate can be tried per connection and the loop ends at the first
   /// failure; the peer redials. And a candidate whose session is already live
-  /// short-circuits the establisher (one handshake per *session*, not per
-  /// link), which is right for a link this device dialed but proves nothing
-  /// about who opened a socket someone else did — so those candidates are
-  /// only considered when the roster leaves nobody else it could have been.
+  /// is never considered at all: a live session short-circuits the establisher
+  /// (one handshake per *session*, not per link), which is right for a link
+  /// this device dialed but means **no handshake runs** on this path — so
+  /// adopting one would let anyone who can reach the listener port take over
+  /// the peer's traffic without holding a single key. Because LAN outranks
+  /// every relay, that socket would become the active link immediately.
+  ///
+  /// The cost is that an already-live session cannot be upgraded onto an
+  /// inbound LAN link; it upgrades on the next link this device dials, or
+  /// after the session dies. Closing that gap needs a pre-handshake identity
+  /// hint the wire format does not carry, and is a separate design decision.
   Future<void> _acceptInbound(Link link) async {
     for (final peer in _inboundCandidates()) {
       if (_shutdown || !_started) break;
@@ -272,23 +279,33 @@ class OmniFiEngine {
     await _closeQuietly(link);
   }
 
-  /// Roster entries an inbound link could still be authenticated as. See
-  /// [_acceptInbound] for why a live session disqualifies a candidate once
-  /// there is more than one of them.
-  List<PeerRecord> _inboundCandidates() {
-    final peers = mesh.peers;
-    if (peers.length <= 1) return peers.toList();
-    return [
-      for (final peer in peers)
-        if (_sessions[peer.deviceId]?.isDead != false) peer,
-    ];
-  }
+  /// Roster entries an inbound link could still be authenticated as.
+  ///
+  /// A live session disqualifies its peer unconditionally, including when it
+  /// is the only peer in the roster. That "only peer" case used to be exempt,
+  /// on the reasoning that the roster left nobody else the connection could
+  /// have been — but the roster is not what is in question here. Nothing on
+  /// this path authenticates *who opened the socket*, and the exemption
+  /// applied in exactly the single-peer configuration this ships with. See
+  /// [_acceptInbound].
+  List<PeerRecord> _inboundCandidates() => [
+        for (final peer in mesh.peers)
+          if (_sessions[peer.deviceId]?.isDead != false) peer,
+      ];
 
   /// Resolves a LAN endpoint for [peer] from discovery and dials it.
   ///
-  /// Only installed as a dialer when discovery is configured, so a mesh with
-  /// no static endpoints produces no LAN candidate at all rather than a
-  /// dialer that exists only to fail.
+  /// Installed as a dialer whenever *any* [LanDiscovery] is configured — the
+  /// condition is `config.lanDiscovery != null`, not "discovery can name an
+  /// endpoint". With [StaticDiscovery] that distinction does not arise: the
+  /// endpoints are known up front, and an empty list fails the dial in a
+  /// microtask. With [MdnsDiscovery] it does: `multicast_dns` is query-only,
+  /// so until a platform responder advertises this service (Tasks 22 and 23)
+  /// **no peer ever answers**, and every dial burns the full
+  /// [_lanDiscoveryTimeout] before failing. That is a dialer that exists only
+  /// to fail, and it is what the intended production configuration installs.
+  /// It costs a timeout per backoff round, not correctness: the relay
+  /// candidates are dialed concurrently and carry the traffic throughout.
   Future<Link> _dialLan(PeerRecord peer) async {
     final discovery = config.lanDiscovery;
     if (discovery == null) {
@@ -373,8 +390,9 @@ class OmniFiEngine {
       // other by measured RTT. Adding a backend costs one list entry.
       dialers: [
         // The LAN dialer, and the only thing that makes the transport
-        // LinkManager is built to *prefer* carry any traffic. Installed only
-        // when discovery can actually name an endpoint; see [_dialLan].
+        // LinkManager is built to *prefer* carry any traffic. Installed
+        // whenever a discovery is configured, whether or not that discovery
+        // can currently name an endpoint; see [_dialLan].
         if (config.lanEnabled && config.lanDiscovery != null)
           () => _dialAndEstablish(peer, () => _dialLan(peer)),
         for (final relayBase in config.relayBases)
@@ -451,11 +469,13 @@ class OmniFiEngine {
     // reconciled with the peer's.
     final live = _sessions[peer.deviceId];
     if (live != null && !live.isDead) {
-      // Keep the manager pointing at the live session before returning: this
-      // path is reached by an *inbound* link too, whose caller goes straight
-      // on to LinkManager.offer(), and offer() reads `session` — which is
-      // late-bound and would otherwise still be unassigned on a manager that
-      // has never had a dial of its own succeed.
+      // Keep the manager pointing at the live session before returning. The
+      // caller goes straight on to LinkManager.offer(), whose _selectBest
+      // reads `session`; a manager that has never had a dial of its own
+      // succeed would otherwise still be holding null and would decline to
+      // attach. Only the dialing path reaches here — _inboundCandidates
+      // excludes a peer whose session is live, precisely because this branch
+      // runs no handshake.
       _managers[peer.deviceId]?.session = live;
       return live;
     }
@@ -622,6 +642,19 @@ class OmniFiEngine {
   }
 
   // ---- Test seams. Not for production use. ----
+
+  /// How [start] binds the inbound LAN listener. Production is
+  /// [LanListener.bind]; nothing but a test ever replaces it.
+  ///
+  /// It exists because the guard immediately after the bind — the one that
+  /// closes a listener handed to an engine that has already stopped — sits in
+  /// a window nothing outside can reach. A real `ServerSocket.bind` resolves
+  /// in a microtask, so a test that tried to land a `stop()` inside it would
+  /// be pinning itself to how many microtasks dart:io happens to schedule. A
+  /// binder that suspends after binding puts the stop exactly where a slow
+  /// bind would, and leaves every other line of the path untouched.
+  Future<LanListener> Function({required String localDeviceId, int port})
+      debugBindListener = LanListener.bind;
 
   void debugSetPeerStatus(String deviceId, ConnectionStatus status) {
     _peerStatuses[deviceId] = status;

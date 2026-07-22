@@ -108,9 +108,16 @@ class SessionEstablisher {
     // while it is between reads. Same reason PairingFlow does this.
     final inbox = StreamIterator<Uint8List>(link.inbound);
     try {
-      final ownMessage = await handshake.start();
-      // Armed before the send so the peer's reply cannot outrun the listen.
+      // Armed before the *first* suspension, not just before the first send:
+      // a StreamIterator does not subscribe until moveNext() is called, so
+      // arming it after `handshake.start()` leaves nothing listening across
+      // that await. It is safe today only because X25519 key generation
+      // resolves on the microtask queue; a platform-channel-backed provider
+      // such as cryptography_flutter suspends for real, the peer's first
+      // frame is dropped, and the exchange hangs to the timeout with no
+      // diagnostic.
       final peerMessageArrived = inbox.moveNext();
+      final ownMessage = await handshake.start();
       await link.send(ownMessage);
       if (!await peerMessageArrived) {
         throw const SessionEstablishmentError(
