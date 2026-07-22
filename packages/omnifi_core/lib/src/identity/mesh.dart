@@ -3,6 +3,13 @@ import 'dart:convert';
 import 'device_identity.dart';
 import 'secure_store.dart';
 
+class MeshError implements Exception {
+  const MeshError(this.reason);
+  final String reason;
+  @override
+  String toString() => 'MeshError: $reason';
+}
+
 const _kMeshId = 'omnifi.mesh.id';
 const _kRoster = 'omnifi.mesh.roster';
 
@@ -42,13 +49,27 @@ class PeerRecord {
         addedAtMs is! int) {
       throw ArgumentError('malformed peer record');
     }
+    final List<int> decodedKey;
+    try {
+      decodedKey = base64Decode(publicKey);
+    } on FormatException {
+      throw ArgumentError('malformed peer record: publicKey is not valid '
+          'base64');
+    }
     return PeerRecord(
       deviceId: deviceId,
-      publicKey: base64Decode(publicKey),
+      publicKey: decodedKey,
       displayName: displayName,
       addedAtMs: addedAtMs,
     );
   }
+}
+
+Map<String, Object?> _asStringKeyedMap(Object? value) {
+  if (value is! Map) {
+    throw ArgumentError('malformed mesh: peers entry is not a map');
+  }
+  return value.map((k, v) => MapEntry(k.toString(), v));
 }
 
 class Mesh {
@@ -95,8 +116,7 @@ class Mesh {
       meshId: meshId,
       peers: [
         for (final p in peers)
-          PeerRecord.fromMap((p as Map).map(
-              (k, v) => MapEntry(k.toString(), v))),
+          PeerRecord.fromMap(_asStringKeyedMap(p)),
       ],
     );
   }
@@ -111,7 +131,14 @@ Future<Mesh> loadOrCreateMesh({required SecureStore store}) async {
   }
   final roster = await store.read(_kRoster);
   if (roster == null) {
-    return Mesh(meshId: existingId);
+    throw const MeshError(
+      'stored mesh id is present but the roster (omnifi.mesh.roster) is '
+      'missing. Continuing with an empty roster is refused, since that '
+      'would silently deauthorize every previously-paired device. To '
+      'recover, restore the missing roster entry from a backup if '
+      'possible; otherwise delete all of the omnifi.mesh.* keys to '
+      'deliberately start a new mesh.',
+    );
   }
   final decoded = jsonDecode(roster);
   if (decoded is! Map) {

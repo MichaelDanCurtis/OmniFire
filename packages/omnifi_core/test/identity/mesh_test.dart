@@ -94,4 +94,58 @@ void main() {
       throwsA(isA<ArgumentError>()),
     );
   });
+
+  test('fresh store still creates a new mesh normally', () async {
+    final store = InMemorySecureStore();
+    final mesh = await loadOrCreateMesh(store: store);
+    expect(mesh.meshId, matches(RegExp(r'^[0-9a-f]{32}$')));
+    expect(mesh.peers, isEmpty);
+  });
+
+  test(
+      'throws MeshError when mesh id is stored but roster is missing '
+      '(partial state)', () async {
+    final store = InMemorySecureStore();
+    final mesh = await loadOrCreateMesh(store: store);
+    mesh.addPeer(peer('b' * 32, name: 'iPhone'));
+    await saveMesh(mesh, store);
+
+    // Simulate a partial write / storage eviction: the mesh id survives but
+    // the roster entry is gone.
+    await store.delete('omnifi.mesh.roster');
+
+    expect(
+      () => loadOrCreateMesh(store: store),
+      throwsA(
+        isA<MeshError>().having(
+          (e) => e.reason,
+          'reason',
+          contains('roster'),
+        ),
+      ),
+    );
+  });
+
+  test('fromMap throws ArgumentError when a peers entry is not a map', () {
+    expect(
+      () => Mesh.fromMap({
+        'meshId': 'a' * 32,
+        'peers': ['not a map'],
+      }),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('PeerRecord.fromMap throws ArgumentError on invalid base64 publicKey',
+      () {
+    expect(
+      () => PeerRecord.fromMap({
+        'deviceId': 'b' * 32,
+        'publicKey': 'not-valid-base64!!',
+        'displayName': 'Bad',
+        'addedAtMs': 1,
+      }),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
 }
