@@ -9066,3 +9066,62 @@ Changes made to this plan after its first draft, with the reason each was made.
 | 2026-07-22 | `RelayLink.id` changed from `relay:<peer>` to `relay:<host>:<peer>` | Two relay backends dialed for the same peer would collide in `LinkManager`'s candidate map, silently evicting one. |
 | 2026-07-22 | `EngineConfig.relayBase` → `relayBases` (a list); engine builds one dialer per entry | Second relay backend adopted (ARC). Needs no new failover logic — `LinkManager` already ranks competing candidates. |
 | 2026-07-22 | Added Task 27 (ARC mesh relay route) | A production Rust relay already exists and is deployed; running both backends gives redundancy. Decided by the project owner. |
+
+---
+
+## Task 28: Session establishment — handshake on first link adoption
+
+Added after review found that `OmniFiEngine._connectPeer` builds every `PeerSession` with **all-zero AEAD keys**, with a comment deferring to a handshake that nothing in the plan ever performs. Pairing produces a real session; nothing re-establishes one when a device reconnects. Without this, Project 1's acceptance matrix cannot pass — "survives sleep/wake" and "survives network loss" both require reconnect.
+
+**Files:**
+- Create: `packages/omnifi_core/lib/src/session/session_establisher.dart`
+- Modify: `packages/omnifi_core/lib/src/engine/omnifi_engine.dart`
+- Modify: `packages/omnifi_core/lib/omnifi_core.dart`
+- Test: `packages/omnifi_core/test/session/session_establisher_test.dart`
+
+**Interfaces:**
+- Consumes: `OmniFiHandshakeV1`, `StaticKeyPair`, `HandshakeResult`, `HandshakeError` (Task 4); `DeviceIdentity` (Task 9); `PeerRecord`, `Mesh` (Task 10); `Link`, `LinkClosedError` (Task 11); `AeadSession` (Task 3); `PeerSession` (Task 13).
+- Produces:
+  - `class SessionEstablisher` with `static Future<AeadSession> establish({required Link link, required DeviceIdentity identity, required PeerRecord peer, Duration timeout = const Duration(seconds: 10)})`
+  - `class SessionEstablishmentError implements Exception`
+  - `bool isInitiatorFor(String localDeviceId, String peerDeviceId)` — deterministic role assignment.
+
+### Design
+
+**One handshake per session, not per link.** `PeerSession` is keyed to the device pair and survives link migration without renegotiating crypto — that is the whole point of the migration design. So the handshake runs **once**, on the first link adopted for a peer, and every later link reuses the same `AeadSession`. If a session dies (a decryption failure marks it dead and forces re-handshake), the engine discards it and establishes a fresh one on the next link.
+
+**Role assignment is deterministic, not negotiated.** The device whose ID is lexicographically smaller is the initiator:
+
+```dart
+bool isInitiatorFor(String localDeviceId, String peerDeviceId) =>
+    localDeviceId.compareTo(peerDeviceId) < 0;
+```
+
+Both sides compute the same answer from data they already hold, so there is no negotiation round and no tie to break — device IDs are 128-bit random and collisions are not a practical concern. A negotiation round here would be a second place for the protocol to diverge.
+
+**Authentication is mutual and roster-bound.** Unlike pairing, both sides already know each other's static public key, so `expectedPeerStaticPublicKey` is the peer's key **from the roster** and `psk` is empty. That is what makes a reconnect to a known device mutually authenticated: a device presenting a different static key fails the handshake rather than being trusted on the strength of its device ID.
+
+**The handshake runs on the raw `Link`, before any `PeerSession` exists.** It exchanges the handshake message and the confirmation using a buffered `StreamIterator` over `link.inbound`, armed before each send — the same pattern `PairingFlow` uses, and for the same reason: `inbound` is a broadcast stream, and a frame sent while no listener is attached is dropped, producing an intermittent hang rather than a clean failure.
+
+**On failure the link is closed and not adopted.** A handshake failure means the peer is not who the roster says it is, or the link is broken. Either way the link must not become a session candidate. Close it and surface `SessionEstablishmentError`.
+
+### Engine changes
+
+- `_connectPeer` no longer constructs a `PeerSession` with zero keys. It creates the session lazily, after the first successful establishment.
+- The dialers produce a `Link`; before offering it to `LinkManager`, the engine establishes a session if it does not yet have a live one for that peer, then attaches.
+- If `session.isDead`, discard it and establish afresh on the next adopted link.
+- A failed establishment must not count as a successful dial for backoff purposes.
+
+### Tests
+
+1. Two engines with each other in their rosters establish a session over a connected link pair, and a frame sealed by one opens on the other.
+2. Role assignment is deterministic and opposite: `isInitiatorFor(a, b)` and `isInitiatorFor(b, a)` disagree, for both orderings.
+3. A peer presenting a static key that does not match its roster entry fails with `SessionEstablishmentError`, and the link is closed.
+4. Establishment does **not** re-run when a second link is adopted for a peer that already has a live session — assert the same `AeadSession` instance is reused and no second handshake occurs.
+5. A dead session is replaced: mark a session dead, adopt a new link, and assert a fresh handshake runs and a new session is installed.
+6. A link that closes mid-handshake surfaces `SessionEstablishmentError`, not a raw `LinkClosedError` or a hang.
+7. Establishment respects the timeout: a peer that never responds fails within the timeout rather than hanging.
+
+### Note on scope
+
+This does not add key rotation, session resumption, or 0-RTT. A reconnect costs one full handshake — three X25519 operations and a round trip — which is negligible against the reconnect itself.
