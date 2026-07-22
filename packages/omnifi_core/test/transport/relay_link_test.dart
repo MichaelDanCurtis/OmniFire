@@ -13,8 +13,17 @@ class FakeChannel extends StreamChannelMixin<Object?>
   final StreamController<Object?> _incoming =
       StreamController<Object?>.broadcast();
   final List<Object?> sent = [];
+  int? _closeCode;
+  bool sinkClosed = false;
 
   void deliver(Object? message) => _incoming.add(message);
+
+  /// Simulates the relay closing the socket with [code], e.g. 1009 when a
+  /// frame exceeded the 1 MiB limit.
+  Future<void> deliverClose(int code) async {
+    _closeCode = code;
+    await _incoming.close();
+  }
 
   @override
   Stream<Object?> get stream => _incoming.stream;
@@ -23,7 +32,7 @@ class FakeChannel extends StreamChannelMixin<Object?>
   WebSocketSink get sink => _FakeSink(this);
 
   @override
-  int? get closeCode => null;
+  int? get closeCode => _closeCode;
 
   @override
   String? get closeReason => null;
@@ -47,7 +56,102 @@ class _FakeSink implements WebSocketSink {
 
   @override
   Future<void> close([int? closeCode, String? closeReason]) async {
+    _channel.sinkClosed = true;
     await _channel._incoming.close();
+  }
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// A channel whose handshake never completes, to exercise the connect()
+/// timeout path.
+class _HangingChannel extends StreamChannelMixin<Object?>
+    implements WebSocketChannel {
+  final StreamController<Object?> _incoming =
+      StreamController<Object?>.broadcast();
+  bool sinkClosed = false;
+
+  @override
+  Stream<Object?> get stream => _incoming.stream;
+
+  @override
+  WebSocketSink get sink => _HangingSink(this);
+
+  @override
+  int? get closeCode => null;
+
+  @override
+  String? get closeReason => null;
+
+  @override
+  String? get protocol => null;
+
+  @override
+  Future<void> get ready => Completer<void>().future;
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _HangingSink implements WebSocketSink {
+  _HangingSink(this._channel);
+  final _HangingChannel _channel;
+
+  @override
+  void add(Object? data) {}
+
+  @override
+  Future<void> close([int? closeCode, String? closeReason]) async {
+    _channel.sinkClosed = true;
+  }
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// A channel whose `ready` future completes with an error, as
+/// web_socket_channel does when the relay rejects the handshake (e.g. an
+/// HTTP 400 for a malformed mesh/device id) before the upgrade completes.
+class _RejectingChannel extends StreamChannelMixin<Object?>
+    implements WebSocketChannel {
+  final StreamController<Object?> _incoming =
+      StreamController<Object?>.broadcast();
+  bool sinkClosed = false;
+
+  @override
+  Stream<Object?> get stream => _incoming.stream;
+
+  @override
+  WebSocketSink get sink => _HangingSink2(this);
+
+  @override
+  int? get closeCode => null;
+
+  @override
+  String? get closeReason => null;
+
+  @override
+  String? get protocol => null;
+
+  @override
+  Future<void> get ready =>
+      Future<void>.error(StateError('HTTP 400: malformed device id'));
+
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _HangingSink2 implements WebSocketSink {
+  _HangingSink2(this._channel);
+  final _RejectingChannel _channel;
+
+  @override
+  void add(Object? data) {}
+
+  @override
+  Future<void> close([int? closeCode, String? closeReason]) async {
+    _channel.sinkClosed = true;
   }
 
   @override
@@ -176,5 +280,152 @@ void main() {
     await link.close();
     expect(() => link.send(utf8.encode('x')),
         throwsA(isA<LinkClosedError>()));
+  });
+
+  group('id', () {
+    test('includes the relay host and port', () async {
+      final fake = FakeChannel();
+      final link = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8787'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => fake,
+      );
+      expect(link.id, contains('localhost'));
+      expect(link.id, contains('8787'));
+      expect(link.id, contains('2' * 32));
+    });
+
+    test('is stable for an https base with no explicit port', () async {
+      final fake = FakeChannel();
+      final link = await RelayLink.connect(
+        relayBase: Uri.parse('https://relay.example.com'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => fake,
+      );
+      // Uri.port returns the scheme default (443) when absent, so the id
+      // is deterministic across separate calls with the same base.
+      final again = await RelayLink.connect(
+        relayBase: Uri.parse('https://relay.example.com'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => FakeChannel(),
+      );
+      expect(link.id, again.id);
+    });
+
+    test(
+        'two relays on the same host at different ports for the same peer '
+        'get distinct ids', () async {
+      // This is the local dev setup: two relay backends both on
+      // localhost, at different ports, dialed for the same peer at the
+      // same time. Before the port was part of the id, both links
+      // produced 'relay:localhost:<peer>' and collided in LinkManager's
+      // candidate map.
+      final linkA = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8787'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => FakeChannel(),
+      );
+      final linkB = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8788'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => FakeChannel(),
+      );
+      expect(linkA.id, isNot(linkB.id));
+    });
+  });
+
+  group('connect() handshake failures', () {
+    test('closes the channel and throws when the handshake times out',
+        () async {
+      final fake = _HangingChannel();
+      await expectLater(
+        RelayLink.connect(
+          relayBase: Uri.parse('http://localhost:8787'),
+          meshId: 'a' * 32,
+          localDeviceId: '1' * 32,
+          peerDeviceId: '2' * 32,
+          timeout: const Duration(milliseconds: 20),
+          channelFactory: (_) => fake,
+        ),
+        throwsA(anything),
+      );
+      expect(fake.sinkClosed, isTrue);
+    });
+
+    test(
+        'rejects promptly, without waiting out the timeout, when the relay '
+        'rejects the handshake before the upgrade completes', () async {
+      // The relay answers a malformed mesh/device id with a plain HTTP 400
+      // before the WebSocket upgrade completes, so `ready` fails
+      // immediately rather than the socket ever reaching a close event.
+      final fake = _RejectingChannel();
+      final stopwatch = Stopwatch()..start();
+      await expectLater(
+        RelayLink.connect(
+          relayBase: Uri.parse('http://localhost:8787'),
+          meshId: 'a' * 32,
+          localDeviceId: '1' * 32,
+          peerDeviceId: '2' * 32,
+          timeout: const Duration(seconds: 5),
+          channelFactory: (_) => fake,
+        ),
+        throwsA(isA<StateError>()),
+      );
+      stopwatch.stop();
+      // Generous margin so this isn't flaky, but far below the 5s timeout:
+      // if connect() were waiting out the timeout instead of surfacing the
+      // rejection promptly, this would fail.
+      expect(stopwatch.elapsedMilliseconds, lessThan(2000));
+      expect(fake.sinkClosed, isTrue);
+    });
+  });
+
+  group('abnormal close', () {
+    test('an ordinary close (no code) reports disconnected', () async {
+      final fake = FakeChannel();
+      final link = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8787'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => fake,
+      );
+      final states = <LinkState>[];
+      link.states.listen(states.add);
+      await fake.deliverClose(1000);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(link.state, LinkState.disconnected);
+      expect(link.closeCode, 1000);
+      expect(states, [LinkState.disconnected]);
+    });
+
+    test('a 1009 close (frame too large) reports failed with the code',
+        () async {
+      final fake = FakeChannel();
+      final link = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8787'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        peerDeviceId: '2' * 32,
+        channelFactory: (_) => fake,
+      );
+      final states = <LinkState>[];
+      link.states.listen(states.add);
+      await fake.deliverClose(1009);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(link.state, LinkState.failed);
+      expect(link.closeCode, 1009);
+      expect(states, [LinkState.failed]);
+    });
   });
 }

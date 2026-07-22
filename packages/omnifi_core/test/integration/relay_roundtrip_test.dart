@@ -74,4 +74,25 @@ void main() {
     await sa.dispose();
     await sb.dispose();
   });
+
+  test(
+      'connect fails promptly, not with a timeout, when the relay rejects '
+      'a malformed device id before the upgrade', () async {
+    final stopwatch = Stopwatch()..start();
+    await expectLater(
+      RelayLink.connect(
+        relayBase: base,
+        meshId: meshId,
+        localDeviceId: 'not-a-valid-hex-device-id',
+        peerDeviceId: deviceB,
+        timeout: const Duration(seconds: 10),
+      ),
+      throwsA(anything),
+    );
+    stopwatch.stop();
+    // The relay answers with a plain HTTP 400 before the WebSocket upgrade
+    // completes, so this should fail almost immediately, not after the 10s
+    // timeout.
+    expect(stopwatch.elapsedMilliseconds, lessThan(3000));
+  });
 }
