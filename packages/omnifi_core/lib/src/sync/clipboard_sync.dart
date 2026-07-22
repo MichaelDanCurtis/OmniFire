@@ -11,6 +11,12 @@ import 'clipboard_watcher.dart';
 
 const int maxClipboardBytes = 1048576;
 
+/// How far ahead of the local clock an incoming payload's timestamp may be
+/// before it is treated as implausible and rejected. Generous enough to
+/// absorb genuine inter-device clock skew, tight enough that a poisoned
+/// timestamp (buggy clock, or a malicious peer) cannot survive.
+const int maxClockSkewMs = 5 * 60 * 1000;
+
 const String _clipboardCollapseKey = 'clipboard';
 
 String clipboardHash(String format, List<int> data) {
@@ -40,11 +46,15 @@ class ClipboardSync {
   bool _lockPaused = false;
   int _skippedConcealedCount = 0;
   int _skippedOversizedCount = 0;
+  int _skippedSkewedCount = 0;
+  int _skippedUnsupportedFormatCount = 0;
 
   String? get lastAppliedHash => _lastAppliedHash;
   bool get isPaused => _userPaused || _lockPaused;
   int get skippedConcealedCount => _skippedConcealedCount;
   int get skippedOversizedCount => _skippedOversizedCount;
+  int get skippedSkewedCount => _skippedSkewedCount;
+  int get skippedUnsupportedFormatCount => _skippedUnsupportedFormatCount;
 
   Future<void> start() async {
     await _watcher.start();
@@ -90,17 +100,30 @@ class ClipboardSync {
       return;
     }
 
+    final ClipboardPayload payload;
+    try {
+      payload = ClipboardPayload(
+        format: content.format,
+        data: content.data,
+        timestampMs: now,
+        contentHash: hash,
+      );
+    } on EnvelopeError {
+      // `ClipboardContent.format` documents that it must be one of
+      // `supportedClipboardFormats`, but nothing enforces that upstream --
+      // the platform watchers that would guarantee it are implemented
+      // outside this package. Mirror the incoming path: skip gracefully
+      // rather than let this throw uncaught out of the stream listener.
+      _skippedUnsupportedFormatCount++;
+      return;
+    }
+
     _lastAppliedHash = hash;
     _lastAppliedTimestampMs = now;
 
     await _broadcast(
       MessageType.clipboardUpdate,
-      ClipboardPayload(
-        format: content.format,
-        data: content.data,
-        timestampMs: now,
-        contentHash: hash,
-      ).toMap(),
+      payload.toMap(),
       collapseKey: _clipboardCollapseKey,
     );
   }
@@ -129,6 +152,19 @@ class ClipboardSync {
     try {
       payload = ClipboardPayload.fromMap(envelope.payload);
     } on EnvelopeError {
+      return;
+    }
+
+    if (payload.timestampMs > _clock() + maxClockSkewMs) {
+      // A timestamp implausibly far ahead of our own clock -- a skewed
+      // clock, or a malicious peer -- must be rejected outright rather than
+      // clamped. Accepting it (even clamped to "now") would still advance
+      // `_lastAppliedTimestampMs` to a value the sender never actually
+      // sent, and once that watermark is ahead of the real clock, every
+      // subsequent legitimate update from any peer looks "older" and is
+      // silently dropped by the check below -- incoming sync stays broken
+      // until this device happens to make its own local clipboard copy.
+      _skippedSkewedCount++;
       return;
     }
 

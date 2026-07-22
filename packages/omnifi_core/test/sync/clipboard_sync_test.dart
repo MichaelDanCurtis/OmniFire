@@ -304,4 +304,132 @@ void main() {
     ));
     expect(watcher.current, isNull);
   });
+
+  // --- REPRO (stage 1, no source fix yet): a far-future timestamp from a
+  // skewed or malicious peer must not poison `_lastAppliedTimestampMs`. ---
+  test(
+      'a far-future timestamp does not poison state against a later '
+      'legitimate update', () async {
+    final watcher = FakeClipboardWatcher();
+    final sync =
+        ClipboardSync(watcher: watcher, peers: () => [], clock: testClock);
+    await sync.start();
+
+    const tenYearsMs = 10 * 365 * 24 * 60 * 60 * 1000;
+    await sync.handleIncoming(Envelope(
+      version: omnifiProtocolVersion,
+      type: MessageType.clipboardUpdate,
+      senderDeviceId: 'b' * 32,
+      messageId: 'm' * 32,
+      timestampMs: _now + tenYearsMs,
+      payload: ClipboardPayload(
+        format: 'text',
+        data: Uint8List.fromList(utf8.encode('from a skewed clock')),
+        timestampMs: _now + tenYearsMs,
+        contentHash:
+            clipboardHash('text', utf8.encode('from a skewed clock')),
+      ).toMap(),
+    ));
+
+    // A subsequent legitimate update, timestamped at the real current time,
+    // must still apply. Pre-fix this fails: the far-future payload above
+    // sets `_lastAppliedTimestampMs` ten years ahead, so every real update
+    // looks "older" and is silently dropped forever.
+    await sync.handleIncoming(Envelope(
+      version: omnifiProtocolVersion,
+      type: MessageType.clipboardUpdate,
+      senderDeviceId: 'b' * 32,
+      messageId: 'm' * 32,
+      timestampMs: _now,
+      payload: ClipboardPayload(
+        format: 'text',
+        data: Uint8List.fromList(utf8.encode('legitimate update')),
+        timestampMs: _now,
+        contentHash: clipboardHash('text', utf8.encode('legitimate update')),
+      ).toMap(),
+    ));
+
+    expect(utf8.decode(watcher.current!.data), 'legitimate update');
+    expect(sync.skippedSkewedCount, 1);
+  });
+
+  test('a timestamp within tolerance of the local clock is still accepted',
+      () async {
+    final watcher = FakeClipboardWatcher();
+    final sync =
+        ClipboardSync(watcher: watcher, peers: () => [], clock: testClock);
+    await sync.start();
+
+    // Comfortably inside the 5-minute tolerance -- the bound must not
+    // simply reject everything.
+    final withinToleranceMs = maxClockSkewMs - 1000;
+    await sync.handleIncoming(Envelope(
+      version: omnifiProtocolVersion,
+      type: MessageType.clipboardUpdate,
+      senderDeviceId: 'b' * 32,
+      messageId: 'm' * 32,
+      timestampMs: _now + withinToleranceMs,
+      payload: ClipboardPayload(
+        format: 'text',
+        data: Uint8List.fromList(utf8.encode('slightly ahead')),
+        timestampMs: _now + withinToleranceMs,
+        contentHash: clipboardHash('text', utf8.encode('slightly ahead')),
+      ).toMap(),
+    ));
+
+    expect(utf8.decode(watcher.current!.data), 'slightly ahead');
+    expect(sync.skippedSkewedCount, 0);
+  });
+
+  // --- REPRO (stage 1, no source fix yet): the outgoing path must not
+  // throw uncaught when the platform watcher reports an unsupported
+  // format. ---
+  test('an unsupported outgoing format is skipped, not thrown uncaught',
+      () async {
+    final s = linkedSessions();
+    final watcher = FakeClipboardWatcher();
+    final sync = ClipboardSync(
+      watcher: watcher, peers: () => [s.local], clock: testClock);
+    await sync.start();
+
+    var broadcasts = 0;
+    s.remote.inbound.listen((_) => broadcasts++);
+
+    watcher.emit(ClipboardContent(
+      format: 'rtf',
+      data: Uint8List.fromList(utf8.encode(r'{\rtf1 hello}')),
+      isConcealed: false,
+    ));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+
+    expect(broadcasts, 0);
+    expect(sync.skippedUnsupportedFormatCount, 1);
+  });
+
+  // --- Minor: the incoming size-cap check had no direct test (the outgoing
+  // one does). This is a regression guard for code already verified correct
+  // by inspection, not a reproduction of a bug. ---
+  test('an oversized incoming payload is not applied', () async {
+    final watcher = FakeClipboardWatcher();
+    final sync =
+        ClipboardSync(watcher: watcher, peers: () => [], clock: testClock);
+    await sync.start();
+
+    final oversized = Uint8List(maxClipboardBytes + 1);
+    await sync.handleIncoming(Envelope(
+      version: omnifiProtocolVersion,
+      type: MessageType.clipboardUpdate,
+      senderDeviceId: 'b' * 32,
+      messageId: 'm' * 32,
+      timestampMs: _now,
+      payload: ClipboardPayload(
+        format: 'png',
+        data: oversized,
+        timestampMs: _now,
+        contentHash: clipboardHash('png', oversized),
+      ).toMap(),
+    ));
+
+    expect(watcher.current, isNull);
+  });
 }
