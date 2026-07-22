@@ -6,3 +6,4 @@ export 'src/crypto/aead_session.dart';
 export 'src/crypto/handshake.dart';
 export 'src/crypto/sas.dart';
 export 'src/crypto/wordlist.dart';
+export 'src/protocol/framing.dart';
