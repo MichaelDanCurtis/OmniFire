@@ -16,11 +16,23 @@ import '../transport/link.dart';
 import '../transport/link_manager.dart';
 import '../transport/relay_link.dart';
 
+/// Raised when no LAN link could be dialed for a peer. Ordinary, not
+/// exceptional: [LinkManager] treats it as a failed dial, grows the backoff,
+/// and the relay candidates carry the traffic in the meantime.
+class LanDialError implements Exception {
+  const LanDialError(this.reason);
+  final String reason;
+  @override
+  String toString() => 'LanDialError: $reason';
+}
+
 class EngineConfig {
   const EngineConfig({
     required this.relayBases,
     required this.displayName,
     this.lanEnabled = true,
+    this.lanDiscovery,
+    this.lanPort = 0,
   });
 
   /// Every relay backend to dial, in descending order of preference.
@@ -33,6 +45,23 @@ class EngineConfig {
 
   final String displayName;
   final bool lanEnabled;
+
+  /// How LAN peers are located for dialing, and where this device's listening
+  /// port is advertised.
+  ///
+  /// Null means "accept, but never dial": the engine still binds a listener
+  /// and adopts inbound LAN connections, it just contributes no LAN candidate
+  /// of its own. [StaticDiscovery] is the manual "connect to this IP" path
+  /// and the one tests use; [MdnsDiscovery] is query-only until a platform
+  /// responder lands (Tasks 22 and 23), so a mesh whose peers are not
+  /// statically configured simply produces no LAN candidate and falls back to
+  /// the relay. That is a stated limitation, not a hidden one.
+  final LanDiscovery? lanDiscovery;
+
+  /// Port for the inbound LAN listener. 0 asks the OS for an ephemeral port,
+  /// which is what production wants; a fixed port is for tests and for
+  /// networks where a firewall rule has to name one.
+  final int lanPort;
 
   /// Convenience for the common single-relay case.
   Uri get primaryRelay => relayBases.first;
@@ -95,7 +124,23 @@ class OmniFiEngine {
   final Map<String, Future<void>> _adoptTails = {};
   final StreamController<ConnectionStatus> _statuses =
       StreamController<ConnectionStatus>.broadcast();
-  final List<StreamSubscription<Object?>> _subs = [];
+
+  /// Per-peer subscriptions, keyed so [forgetPeer] can cancel exactly the ones
+  /// belonging to the peer it is removing.
+  ///
+  /// These used to be one flat unkeyed list, which meant a forgotten peer's
+  /// listeners could not be found: the list grew without bound across
+  /// pair/forget cycles, and a live status listener stayed attached to a
+  /// manager the engine had already discarded, writing into [_peerStatuses]
+  /// for a peer being removed. That it did no visible damage depended on
+  /// microtask ordering nothing documented or tested.
+  final Map<String, StreamSubscription<ConnectionStatus>> _statusSubs = {};
+  final Map<String, StreamSubscription<Envelope>> _inboundSubs = {};
+
+  /// Subscription to the LAN listener's accepted connections. Without it the
+  /// listener's broadcast stream has no subscriber and every accepted socket
+  /// is discarded still open.
+  StreamSubscription<LanLink>? _incomingSub;
 
   /// Tail of the inbound-application chain. See [_applyIncoming].
   Future<void> _incomingTail = Future<void>.value();
@@ -134,18 +179,142 @@ class OmniFiEngine {
 
   Future<void> persist() => saveMesh(mesh, _store);
 
+  /// How long a LAN dial waits for discovery to name an endpoint for the peer
+  /// before giving up. [MdnsDiscovery]'s query stream ends on its own and
+  /// [StaticDiscovery]'s is finite, so this only guards a discovery that
+  /// stalls.
+  static const Duration _lanDiscoveryTimeout = Duration(seconds: 5);
+
   Future<void> start() async {
     if (_started) return;
     _started = true;
     _shutdown = false;
     await clipboard.start();
+    // Re-checked after every suspension point from here on. [stop] flips
+    // `_started` before its own first `await`, so a start() that carried on
+    // regardless would rebuild the maps the teardown has just cleared — on
+    // top of a clipboard that is already stopped — and bind a listener the
+    // teardown has already decided it does not own.
+    if (!_started) return;
 
     if (config.lanEnabled) {
-      _listener = await LanListener.bind(localDeviceId: identity.deviceId);
+      // Bound into a local, not straight into the field: [stop] captures and
+      // nulls `_listener`, so a stop() landing during this bind would leave a
+      // live ServerSocket assigned to an engine that believes it is stopped,
+      // with nothing left to close it.
+      final listener = await LanListener.bind(
+        localDeviceId: identity.deviceId,
+        port: config.lanPort,
+      );
+      if (!_started) {
+        await listener.close();
+        return;
+      }
+      _listener = listener;
+      // [LanListener.incoming] is a broadcast stream: with no subscriber,
+      // every accepted connection is dropped on the floor still open. This is
+      // the only thing that adopts one.
+      // Errors are absorbed here for the same reason [_listenInbound] absorbs
+      // them: one unusable connection is a dropped connection, not an
+      // unhandled async error taking down the app's zone.
+      _incomingSub = listener.incoming.listen(
+        (link) => unawaited(_acceptInbound(link).catchError((Object _) {})),
+      );
+      await config.lanDiscovery
+          ?.advertise(deviceId: identity.deviceId, port: listener.port);
+      if (!_started) return;
     }
 
-    for (final peer in mesh.peers) {
+    // Snapshot: `mesh.peers` already copies, but saying so here keeps the
+    // guarantee local rather than borrowed from another class.
+    for (final peer in mesh.peers.toList()) {
+      if (!_started) return;
       await _connectPeer(peer);
+    }
+  }
+
+  /// Adopts a connection the LAN listener accepted.
+  ///
+  /// An inbound link carries no identity of its own — [LanListener] labels it
+  /// with a provisional id derived from the socket — so the peer is decided by
+  /// the establisher's outcome: a roster candidate whose static key
+  /// authenticates the far end is the peer, and a link that resolves to no
+  /// roster member is closed rather than left open.
+  ///
+  /// Two limits, both stated rather than hidden.
+  /// [SessionEstablisher.establish] closes the link when it fails, so at most
+  /// one candidate can be tried per connection and the loop ends at the first
+  /// failure; the peer redials. And a candidate whose session is already live
+  /// short-circuits the establisher (one handshake per *session*, not per
+  /// link), which is right for a link this device dialed but proves nothing
+  /// about who opened a socket someone else did — so those candidates are
+  /// only considered when the roster leaves nobody else it could have been.
+  Future<void> _acceptInbound(Link link) async {
+    for (final peer in _inboundCandidates()) {
+      if (_shutdown || !_started) break;
+      if (link.state != LinkState.connected) break;
+      final manager = _managers[peer.deviceId];
+      if (manager == null) continue;
+      try {
+        await _adoptLink(peer, link);
+      } on Object {
+        // Not this peer, or the link died proving it. Establishment closes
+        // the link on failure, so the next iteration's state check ends the
+        // loop and the far end redials.
+        continue;
+      }
+      // Exactly the tail a dialed link gets: LinkManager ranks it against
+      // this peer's relay candidates, attaches the session to whichever wins,
+      // and closes it on stop().
+      manager.offer(link);
+      return;
+    }
+    await _closeQuietly(link);
+  }
+
+  /// Roster entries an inbound link could still be authenticated as. See
+  /// [_acceptInbound] for why a live session disqualifies a candidate once
+  /// there is more than one of them.
+  List<PeerRecord> _inboundCandidates() {
+    final peers = mesh.peers;
+    if (peers.length <= 1) return peers.toList();
+    return [
+      for (final peer in peers)
+        if (_sessions[peer.deviceId]?.isDead != false) peer,
+    ];
+  }
+
+  /// Resolves a LAN endpoint for [peer] from discovery and dials it.
+  ///
+  /// Only installed as a dialer when discovery is configured, so a mesh with
+  /// no static endpoints produces no LAN candidate at all rather than a
+  /// dialer that exists only to fail.
+  Future<Link> _dialLan(PeerRecord peer) async {
+    final discovery = config.lanDiscovery;
+    if (discovery == null) {
+      throw const LanDialError('no LAN discovery is configured');
+    }
+    try {
+      await for (final endpoint
+          in discovery.discover().timeout(_lanDiscoveryTimeout)) {
+        if (endpoint.deviceId != peer.deviceId) continue;
+        return await LanLink.dial(endpoint, peerDeviceId: peer.deviceId);
+      }
+    } on TimeoutException {
+      throw LanDialError('LAN discovery named no endpoint for '
+          '${peer.deviceId} within $_lanDiscoveryTimeout');
+    }
+    throw LanDialError('no LAN endpoint was discovered for ${peer.deviceId}');
+  }
+
+  /// Closes best-effort: the link is being abandoned either way, and a
+  /// transport that also fails to tear down cleanly must not turn "this link
+  /// was rejected" into an internal fault.
+  static Future<void> _closeQuietly(Link link) async {
+    try {
+      await link.close();
+    } on Object {
+      // Ignored: see above.
     }
   }
 
@@ -203,6 +372,11 @@ class OmniFiEngine {
       // already prefers LAN over any relay, and ranks relays against each
       // other by measured RTT. Adding a backend costs one list entry.
       dialers: [
+        // The LAN dialer, and the only thing that makes the transport
+        // LinkManager is built to *prefer* carry any traffic. Installed only
+        // when discovery can actually name an endpoint; see [_dialLan].
+        if (config.lanEnabled && config.lanDiscovery != null)
+          () => _dialAndEstablish(peer, () => _dialLan(peer)),
         for (final relayBase in config.relayBases)
           () => _dialAndEstablish(
                 peer,
@@ -216,10 +390,14 @@ class OmniFiEngine {
       ],
     );
     _managers[peer.deviceId] = manager;
-    _subs.add(manager.statuses.listen((s) {
+    // Dropped rather than awaited: registration below must stay on this side
+    // of any suspension point, and there is nothing to wait for.
+    unawaited(_statusSubs.remove(peer.deviceId)?.cancel() ??
+        Future<void>.value());
+    _statusSubs[peer.deviceId] = manager.statuses.listen((s) {
       _peerStatuses[peer.deviceId] = s;
       _statuses.add(status);
-    }));
+    });
     _peerStatuses[peer.deviceId] = manager.status;
     await manager.start();
   }
@@ -272,7 +450,15 @@ class OmniFiEngine {
     // handshake rather than a counter resync, so its keys can never be
     // reconciled with the peer's.
     final live = _sessions[peer.deviceId];
-    if (live != null && !live.isDead) return live;
+    if (live != null && !live.isDead) {
+      // Keep the manager pointing at the live session before returning: this
+      // path is reached by an *inbound* link too, whose caller goes straight
+      // on to LinkManager.offer(), and offer() reads `session` — which is
+      // late-bound and would otherwise still be unassigned on a manager that
+      // has never had a dial of its own succeed.
+      _managers[peer.deviceId]?.session = live;
+      return live;
+    }
 
     final crypto = await SessionEstablisher.establish(
       link: link,
@@ -285,17 +471,17 @@ class OmniFiEngine {
     // this peer while it was in flight. Installing a session then would
     // resurrect a peer the user just removed, or leave one behind that the
     // teardown's snapshot will never dispose.
-    if (_shutdown || mesh.peer(peer.deviceId) == null) {
-      try {
-        await link.close();
-      } on Object {
-        // Best effort: the link is being abandoned either way.
-      }
-      throw SessionEstablishmentError(
-          'peer ${peer.deviceId} is no longer connected by this engine');
-    }
+    await _requireStillConnected(peer, link);
+
     final stale = _sessions.remove(peer.deviceId);
+    // The replaced session's inbound listener goes with it. Left attached it
+    // would keep applying that session's envelopes and would never be
+    // cancellable again, since nothing else holds a handle to it.
+    final staleSub = _inboundSubs.remove(peer.deviceId);
+    await staleSub?.cancel();
     await stale?.dispose();
+    // Same check again: disposing the stale session suspends too.
+    await _requireStillConnected(peer, link);
 
     final session = PeerSession(
       localDeviceId: identity.deviceId,
@@ -304,7 +490,7 @@ class OmniFiEngine {
       clock: _clock,
     );
     _sessions[peer.deviceId] = session;
-    _subs.add(_listenInbound(session));
+    _inboundSubs[peer.deviceId] = _listenInbound(session);
     // The manager may already be attached to a *different*, better-ranked
     // link, in which case its own _selectBest would not attach this fresh
     // session to anything. Point it at the link the handshake just ran over.
@@ -313,10 +499,33 @@ class OmniFiEngine {
     return session;
   }
 
-  Future<PairingSasPending> beginInvite(Link link) => PairingFlow.invite(
+  /// Throws (after closing [link]) when this engine has stopped, or when
+  /// [peer] has been forgotten, since the caller last checked.
+  Future<void> _requireStillConnected(PeerRecord peer, Link link) async {
+    if (!_shutdown && mesh.peer(peer.deviceId) != null) return;
+    await _closeQuietly(link);
+    throw SessionEstablishmentError(
+        'peer ${peer.deviceId} is no longer connected by this engine');
+  }
+
+  /// Runs the inviting side of a pairing over [link], using the invite whose
+  /// QR the user is looking at.
+  ///
+  /// [invite] is a parameter, not something this method mints, and that is the
+  /// whole point: [buildInvite] generates a fresh random pre-shared key on
+  /// every call, and the PSK is mixed into the handshake's HKDF salt. Building
+  /// a second invite here would give the two sides different master secrets
+  /// and so different SAS words on every attempt — a pairing the user is
+  /// trained to reject, correctly, forever. Mirrors [beginJoin], which has
+  /// always taken the invite it was given.
+  Future<PairingSasPending> beginInvite(
+    PairingInvite invite,
+    Link link,
+  ) =>
+      PairingFlow.invite(
         identity: identity,
         mesh: mesh,
-        invite: buildInvite(),
+        invite: invite,
         link: link,
       );
 
@@ -328,6 +537,15 @@ class OmniFiEngine {
 
   Future<void> forgetPeer(String deviceId) async {
     mesh.removePeer(deviceId);
+    // Cancelled first, ahead of everything that suspends. Stopping the manager
+    // below publishes ConnectionStatus.offline, and a listener still attached
+    // to it writes that into _peerStatuses for the very peer being removed;
+    // that this did no damage before depended entirely on the removal below
+    // happening to land after the write.
+    final statusSub = _statusSubs.remove(deviceId);
+    final inboundSub = _inboundSubs.remove(deviceId);
+    await statusSub?.cancel();
+    await inboundSub?.cancel();
     await persist();
     await _managers.remove(deviceId)?.stop();
     await _sessions.remove(deviceId)?.dispose();
@@ -340,7 +558,14 @@ class OmniFiEngine {
   }
 
   Future<void> onWake() async {
-    for (final manager in _managers.values) {
+    // Snapshot before the first suspension point, exactly as [stop] does and
+    // for the same reason LinkManager snapshots inside its own onWake and
+    // stop: forgetPeer() removes from this map and stop() clears it, and wake,
+    // sleep and remove-a-device are one lifecycle, so either can land while
+    // this loop is suspended inside a manager's wake. Iterating the live
+    // collection across the await is a reachable ConcurrentModificationError.
+    final managers = _managers.values.toList();
+    for (final manager in managers) {
       await manager.onWake();
     }
   }
@@ -359,10 +584,18 @@ class OmniFiEngine {
     // teardown was suspended) mutate them mid-loop, which is both a
     // ConcurrentModificationError and a way for a freshly registered manager
     // to survive the stop untracked. Same reason LinkManager.stop() snapshots.
-    final subs = _subs.toList();
+    final subs = <StreamSubscription<Object?>>[
+      ..._statusSubs.values,
+      ..._inboundSubs.values,
+      // Cancelled with the rest so no connection can be accepted and adopted
+      // into the maps this teardown has just cleared.
+      if (_incomingSub != null) _incomingSub!,
+    ];
     final managers = _managers.values.toList();
     final sessions = _sessions.values.toList();
-    _subs.clear();
+    _statusSubs.clear();
+    _inboundSubs.clear();
+    _incomingSub = null;
     _managers.clear();
     _sessions.clear();
     _adoptTails.clear();
@@ -394,6 +627,22 @@ class OmniFiEngine {
     _peerStatuses[deviceId] = status;
   }
 
+  /// The manager the engine is tracking for [deviceId], so a test can drive it
+  /// directly — including after the engine has stopped tracking it.
+  LinkManager? debugManagerFor(String deviceId) => _managers[deviceId];
+
+  /// Peers this engine currently holds a manager for.
+  List<String> get debugTrackedPeerIds => _managers.keys.toList();
+
+  /// Live per-peer subscription count, so an orphaned listener is detectable.
+  int get debugSubscriptionCount => _statusSubs.length + _inboundSubs.length;
+
+  /// Port the LAN listener is bound to, or null when nothing is bound.
+  int? get debugListenerPort => _listener?.port;
+
+  /// Runs the path an accepted LAN connection takes, without a real socket.
+  Future<void> debugAcceptInbound(Link link) => _acceptInbound(link);
+
   /// Runs the adoption path a dialer would run: establishes a session for
   /// [peer] over [link] unless a live one already exists, then attaches.
   Future<PeerSession> debugAdoptLink(PeerRecord peer, Link link) =>
@@ -410,7 +659,7 @@ class OmniFiEngine {
       clock: _clock,
     );
     _sessions[peerDeviceId] = session;
-    _subs.add(_listenInbound(session));
+    _inboundSubs[peerDeviceId] = _listenInbound(session);
     return session;
   }
 }

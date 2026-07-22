@@ -1,22 +1,135 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:omnifi_core/omnifi_core.dart';
 import 'package:test/test.dart';
 
-EngineConfig config({bool lan = false}) => EngineConfig(
+const int fixedClockMs = 1753200000000;
+
+EngineConfig config({
+  bool lan = false,
+  String displayName = 'Test Device',
+  LanDiscovery? discovery,
+  int lanPort = 0,
+}) =>
+    EngineConfig(
       relayBases: [Uri.parse('http://localhost:8787')],
-      displayName: 'Test Device',
+      displayName: displayName,
       lanEnabled: lan,
+      lanDiscovery: discovery,
+      lanPort: lanPort,
     );
 
-Future<OmniFiEngine> engine({SecureStore? store}) => OmniFiEngine.create(
+Future<OmniFiEngine> engine({
+  SecureStore? store,
+  ClipboardWatcher? watcher,
+  EngineConfig? engineConfig,
+}) =>
+    OmniFiEngine.create(
       store: store ?? InMemorySecureStore(),
-      watcher: FakeClipboardWatcher(),
-      config: config(),
-      clock: () => 1753200000000,
+      watcher: watcher ?? FakeClipboardWatcher(),
+      config: engineConfig ?? config(),
+      clock: () => fixedClockMs,
     );
+
+/// The roster entry another device would hold for [id].
+PeerRecord rosterEntryFor(DeviceIdentity id) => PeerRecord(
+      deviceId: id.deviceId,
+      publicKey: id.keys.publicKey,
+      displayName: id.displayName,
+      addedAtMs: 1,
+    );
+
+/// A roster entry for a device that does not exist, for tests that only need
+/// the engine to track *a* peer.
+PeerRecord placeholderPeer(String deviceId, int keyByte) => PeerRecord(
+      deviceId: deviceId,
+      publicKey: List<int>.filled(32, keyByte),
+      displayName: deviceId.substring(0, 8),
+      addedAtMs: 1,
+    );
+
+PeerSession throwawaySession(String localDeviceId, String peerDeviceId) =>
+    PeerSession(
+      localDeviceId: localDeviceId,
+      peerDeviceId: peerDeviceId,
+      crypto: AeadSession(
+        sendKey: List<int>.filled(32, 1),
+        receiveKey: List<int>.filled(32, 2),
+      ),
+      clock: () => fixedClockMs,
+    );
+
+Future<void> pumpUntil(
+  bool Function() done, {
+  Duration timeout = const Duration(seconds: 10),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!done()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw StateError('condition was not met within $timeout');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+}
+
+/// A watcher whose [start] blocks until [gate] is completed, so a teardown can
+/// be driven into the window a suspended [OmniFiEngine.start] is sitting in.
+class GatedClipboardWatcher implements ClipboardWatcher {
+  final Completer<void> gate = Completer<void>();
+  final StreamController<ClipboardContent> _changes =
+      StreamController<ClipboardContent>.broadcast();
+
+  @override
+  Stream<ClipboardContent> get changes => _changes.stream;
+
+  @override
+  Future<void> write(ClipboardContent content) async {}
+
+  @override
+  Future<void> start() => gate.future;
+
+  @override
+  Future<void> stop() async {
+    if (!_changes.isClosed) await _changes.close();
+  }
+}
+
+/// Wraps a [Link] so [close] suspends until released. Everything else
+/// delegates, so a manager tearing this down stalls exactly where a real
+/// socket close would.
+class GatedCloseLink implements Link {
+  GatedCloseLink(this.inner);
+  final Link inner;
+  final Completer<void> _gate = Completer<void>();
+
+  void release() {
+    if (!_gate.isCompleted) _gate.complete();
+  }
+
+  @override
+  String get id => inner.id;
+  @override
+  LinkKind get kind => inner.kind;
+  @override
+  Stream<Uint8List> get inbound => inner.inbound;
+  @override
+  Stream<LinkState> get states => inner.states;
+  @override
+  LinkState get state => inner.state;
+  @override
+  LinkQuality get quality => inner.quality;
+  @override
+  Future<void> send(List<int> frame) => inner.send(frame);
+
+  @override
+  Future<void> close() async {
+    await _gate.future;
+    await inner.close();
+  }
+}
 
 /// A watcher whose [write] genuinely suspends, for a duration that depends on
 /// the content. Without it every write completes in the same microtask and an
@@ -94,6 +207,36 @@ void main() {
     expect(invite.inviterPublicKey, e.identity.keys.publicKey);
     expect(invite.psk.length, 32);
     expect(invite.relayHint, 'http://localhost:8787');
+  });
+
+  test('both sides of a pairing derive the same authentication words',
+      () async {
+    // The invite is built ONCE, by the inviter, and the same object is what
+    // the QR carries to the joiner. beginInvite() minting its own would put a
+    // different random PSK into the HKDF salt on the inviting side, giving
+    // the two devices different master secrets and different SAS words on
+    // every single attempt -- a pairing the user is trained to reject.
+    final inviter = await engine();
+    final joiner = await engine();
+    final invite = inviter.buildInvite();
+    final links = FakeLinkFactory.connectedPair();
+
+    // Concurrent, as they are in reality: neither side waits for the other.
+    final invitePending = inviter.beginInvite(invite, links.a);
+    final joinPending = joiner.beginJoin(invite, links.b);
+    final inviterSide = await invitePending;
+    final joinerSide = await joinPending;
+
+    expect(inviterSide.sas, joinerSide.sas);
+    expect(inviterSide.sas, isNotEmpty);
+
+    // And the pairing completes, on both sides, into matching roster entries.
+    final inviterOutcome = await inviterSide.confirm(true);
+    final joinerOutcome = await joinerSide.confirm(true);
+    expect(inviterOutcome.peer.deviceId, joiner.identity.deviceId);
+    expect(joinerOutcome.peer.deviceId, inviter.identity.deviceId);
+    expect(inviterOutcome.meshId, inviter.mesh.meshId);
+    expect(joinerOutcome.meshId, inviter.mesh.meshId);
   });
 
   test('forgetting a peer removes it from the roster', () async {
@@ -239,5 +382,223 @@ void main() {
       e.clipboard.lastAppliedHash,
       clipboardHash('text', watcher.current!.data),
     );
+  });
+
+  // ---- Fix 3: onWake must not iterate a live collection across an await ----
+
+  test('waking survives a peer being forgotten mid-loop', () async {
+    final e = await engine();
+    const b = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const c = 'cccccccccccccccccccccccccccccccc';
+    e.mesh.addPeer(placeholderPeer(b, 5));
+    e.mesh.addPeer(placeholderPeer(c, 6));
+    await e.start();
+
+    // Give the first manager a link whose close() stalls, so the engine's
+    // wake loop is genuinely suspended between its two managers.
+    final managerB = e.debugManagerFor(b)!;
+    managerB.session = throwawaySession(e.identity.deviceId, b);
+    final stalled =
+        GatedCloseLink(FakeLinkFactory(id: 'stalled-lan', kind: LinkKind.lan));
+    managerB.offer(stalled);
+
+    final waking = e.onWake();
+    // Removes the second manager from the map the wake loop is walking.
+    await e.forgetPeer(c);
+    stalled.release();
+
+    // Without a snapshot this is a ConcurrentModificationError.
+    await waking;
+    expect(e.debugTrackedPeerIds, [b]);
+    await e.stop();
+  });
+
+  // ---- Fix 4: start() must not outlive a stop() that lands mid-flight ----
+
+  test('a stop landing while start is suspended leaves nothing running or '
+      'bound', () async {
+    // A port nobody holds, so "still bound afterwards" is decidable.
+    final probe = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
+    final port = probe.port;
+    await probe.close();
+
+    final watcher = GatedClipboardWatcher();
+    final e = await engine(
+      watcher: watcher,
+      engineConfig: config(lan: true, lanPort: port),
+    );
+    e.mesh.addPeer(placeholderPeer('b' * 32, 5));
+
+    final starting = e.start();
+    await Future<void>.delayed(Duration.zero);
+    await e.stop();
+    // start() resumes into an engine that has already torn itself down.
+    watcher.gate.complete();
+    await starting;
+
+    expect(e.debugTrackedPeerIds, isEmpty);
+    expect(e.debugListenerPort, isNull);
+    expect(e.sessions, isEmpty);
+    expect(e.debugSubscriptionCount, 0);
+    // A ServerSocket bound after the teardown would still own this port.
+    final rebind = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+    await rebind.close();
+  });
+
+  // ---- Fix 5: forgetPeer must cancel that peer's subscriptions ----
+
+  test("a forgotten peer's manager can no longer write into the status map",
+      () async {
+    final e = await engine();
+    const b = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    e.mesh.addPeer(placeholderPeer(b, 5));
+    await e.start();
+    expect(e.debugSubscriptionCount, 1);
+
+    final manager = e.debugManagerFor(b)!;
+    manager.session = throwawaySession(e.identity.deviceId, b);
+
+    await e.forgetPeer(b);
+    expect(e.debugSubscriptionCount, 0);
+    expect(e.status, ConnectionStatus.offline);
+
+    // The manager is discarded but still alive. A status change on it must
+    // not reach _peerStatuses for a peer that has been removed.
+    manager.offer(FakeLinkFactory(id: 'orphan-lan', kind: LinkKind.lan));
+    await Future<void>.delayed(Duration.zero);
+    expect(e.status, ConnectionStatus.offline);
+    await e.stop();
+  });
+
+  test('per-peer subscriptions do not accumulate across pair/forget cycles',
+      () async {
+    final e = await engine();
+    for (var i = 0; i < 3; i++) {
+      final id = String.fromCharCode(0x61 + i) * 32;
+      e.mesh.addPeer(placeholderPeer(id, 5 + i));
+      await e.start();
+      expect(e.debugSubscriptionCount, 1);
+      await e.forgetPeer(id);
+      expect(e.debugSubscriptionCount, 0);
+      await e.stop();
+    }
+  });
+
+  // ---- Fix 2: the LAN transport is actually wired ----
+
+  test('an inbound link is adopted as the roster peer that authenticates',
+      () async {
+    final e = await engine();
+    final peerIdentity = await loadOrCreateIdentity(
+      store: InMemorySecureStore(),
+      displayName: 'Peer',
+    );
+    e.mesh.addPeer(rosterEntryFor(peerIdentity));
+    await e.start();
+
+    final links = FakeLinkFactory.connectedPair();
+    // The far end runs exactly the handshake a real peer runs on reconnect.
+    final peerSide = SessionEstablisher.establish(
+      link: links.b,
+      identity: peerIdentity,
+      peer: rosterEntryFor(e.identity),
+    );
+    await e.debugAcceptInbound(links.a);
+    await peerSide;
+
+    expect(e.sessions.single.peerDeviceId, peerIdentity.deviceId);
+    // And the link went on to the manager, as a dialed one would.
+    expect(
+      e.debugManagerFor(peerIdentity.deviceId)!.candidates,
+      contains(links.a.id),
+    );
+    expect(links.a.state, LinkState.connected);
+    await e.stop();
+  });
+
+  test('an inbound link that resolves to no roster member is closed',
+      () async {
+    final e = await engine();
+    await e.start();
+
+    final links = FakeLinkFactory.connectedPair();
+    await e.debugAcceptInbound(links.a);
+
+    expect(links.a.state, LinkState.disconnected);
+    expect(e.sessions, isEmpty);
+    await e.stop();
+  });
+
+  test('an accepted LAN connection is not left open on the floor', () async {
+    // Nothing subscribes to LanListener.incoming unless the engine does, and
+    // it is a broadcast stream: an unsubscribed listener accepts sockets and
+    // discards them still open, one leaked file descriptor per connection.
+    final e = await engine(engineConfig: config(lan: true));
+    await e.start();
+    expect(e.debugListenerPort, isNotNull);
+
+    final socket = await Socket.connect(
+      InternetAddress.loopbackIPv4,
+      e.debugListenerPort!,
+    );
+    // The roster is empty, so this resolves to nobody and must be closed.
+    await expectLater(
+      socket
+          .listen(null)
+          .asFuture<void>()
+          .timeout(const Duration(seconds: 5)),
+      completes,
+    );
+    await socket.close();
+    await e.stop();
+  });
+
+  test('a discovered LAN peer becomes a direct connection that carries the '
+      'clipboard', () async {
+    final watcherA = FakeClipboardWatcher();
+    final watcherB = FakeClipboardWatcher();
+    final discovery = StaticDiscovery([]);
+
+    final a = await engine(
+      watcher: watcherA,
+      engineConfig:
+          config(lan: true, displayName: 'A', discovery: discovery),
+    );
+    final b = await engine(
+      watcher: watcherB,
+      engineConfig: config(lan: true, displayName: 'B'),
+    );
+
+    // Rostered both ways before either starts: a manager has to exist for a
+    // peer before an inbound link can be adopted for it.
+    a.mesh.addPeer(rosterEntryFor(b.identity));
+    b.mesh.addPeer(rosterEntryFor(a.identity));
+
+    await b.start();
+    discovery.endpoints.add(LanEndpoint(
+      deviceId: b.identity.deviceId,
+      address: InternetAddress.loopbackIPv4,
+      port: b.debugListenerPort!,
+    ));
+    await a.start();
+
+    await pumpUntil(() => a.sessions.isNotEmpty && b.sessions.isNotEmpty);
+    expect(a.sessions.single.peerDeviceId, b.identity.deviceId);
+    expect(b.sessions.single.peerDeviceId, a.identity.deviceId);
+    expect(a.status, ConnectionStatus.connectedDirect);
+    expect(b.status, ConnectionStatus.connectedDirect);
+
+    // And the link carries traffic, which is the whole point of preferring it.
+    watcherA.emit(ClipboardContent(
+      format: 'text',
+      data: Uint8List.fromList(utf8.encode('over the lan')),
+      isConcealed: false,
+    ));
+    await pumpUntil(() =>
+        watcherB.current != null &&
+        utf8.decode(watcherB.current!.data) == 'over the lan');
+
+    await a.stop();
+    await b.stop();
   });
 }
