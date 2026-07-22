@@ -2074,7 +2074,14 @@ git commit -m "feat: add device identity with SecureStore-backed key material"
 **Interfaces:**
 - Consumes: `randomHexId` and `SecureStore` (Task 9), `EnvelopeError` (Task 8).
 - Produces:
-  - `class PeerRecord { final String deviceId; final List<int> publicKey; final String displayName; final int addedAtMs; }` with `toMap()` / `fromMap()`.
+  - `class MeshError implements Exception {
+  const MeshError(this.reason);
+  final String reason;
+  @override
+  String toString() => 'MeshError: $reason';
+}
+
+class PeerRecord { final String deviceId; final List<int> publicKey; final String displayName; final int addedAtMs; }` with `toMap()` / `fromMap()`.
   - `class Mesh { final String meshId; List<PeerRecord> get peers; }` with:
     - `void addPeer(PeerRecord peer)` — replaces an existing record with the same device ID
     - `bool removePeer(String deviceId)` — returns whether anything was removed
@@ -2312,7 +2319,16 @@ Future<Mesh> loadOrCreateMesh({required SecureStore store}) async {
   }
   final roster = await store.read(_kRoster);
   if (roster == null) {
-    return Mesh(meshId: existingId);
+    // Same all-or-nothing rule as loadOrCreateIdentity: a stored mesh ID with
+    // no roster means the two SecureStore keys diverged (partial write, storage
+    // eviction, tampering). Returning an empty roster here would make every
+    // peer unauthorized and present as "pairing mysteriously broke" rather than
+    // as an error. It fails closed, so it is not an authorization bypass — but
+    // it is undiagnosable, which is its own harm.
+    throw const MeshError(
+        'mesh id is stored but its roster is missing; refusing to continue '
+        'with an empty roster. Restore the roster entry, or delete '
+        'omnifi.mesh.* to deliberately start a new mesh.');
   }
   final decoded = jsonDecode(roster);
   if (decoded is! Map) {
