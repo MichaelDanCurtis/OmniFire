@@ -96,6 +96,11 @@ class FakeLink implements Link {
     if (peer != null && identical(peer._peer, this)) {
       peer._peer = null;
       peer._peerClosed = true;
+      // A closed socket is closed at both ends. The remote end sees end-of-
+      // stream on its reads and goes disconnected; it does not sit connected
+      // on a channel with nothing on the other side. Recursion terminates
+      // because the peer's own `_peer` has already been cleared.
+      await peer.close();
     }
     await _inbound.close();
     await _states.close();

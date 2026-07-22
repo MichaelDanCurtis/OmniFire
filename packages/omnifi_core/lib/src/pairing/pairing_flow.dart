@@ -106,7 +106,8 @@ class PairingFlow {
       await link.send(ownMessage);
       if (!await peerMessageArrived) {
         throw const PairingRejectedError(
-            'the link closed before the peer sent its handshake message');
+            'the peer aborted the pairing: the link closed before it sent '
+            'its handshake message');
       }
       final peerMessage = inbox.current;
 
@@ -137,7 +138,8 @@ class PairingFlow {
       await link.send(ownConfirmation);
       if (!await peerConfirmationArrived) {
         throw const PairingRejectedError(
-            'the link closed before the peer sent its key confirmation');
+            'the peer aborted the pairing: the link closed before it sent '
+            'its key confirmation');
       }
       final peerConfirmation = inbox.current;
 
@@ -155,8 +157,29 @@ class PairingFlow {
         sas: sas,
         confirm: (userConfirmed) async {
           if (!userConfirmed) {
+            // Declining is not a local decision. The short authentication
+            // string exists to expose a man-in-the-middle, and in that attack
+            // the user is looking at two screens that disagree: whichever one
+            // they decline on, the *other* flow is still live and would pair
+            // with the attacker if confirmed. Tearing the channel down is
+            // what makes the defence two-sided. It needs no wire message —
+            // and deliberately uses none, since a decline frame sent on this
+            // raw, pre-session link would be unauthenticated and so forgeable
+            // by the very attacker it is meant to stop. A closed link cannot
+            // be forged, only withheld, and withholding it is what an
+            // attacker already has to work with.
+            await link.close();
             throw const PairingRejectedError(
                 'user reported the authentication words did not match');
+          }
+          if (link.state != LinkState.connected) {
+            // The peer went away between the handshake and this confirmation.
+            // Most likely it was the peer's user who declined; either way the
+            // channel this pairing was negotiated over no longer exists, so
+            // there is nothing to confirm.
+            throw const PairingRejectedError(
+                'the peer aborted the pairing: the link closed before this '
+                'side confirmed');
           }
           final completed = result;
           if (completed == null) {
@@ -175,6 +198,12 @@ class PairingFlow {
           );
         },
       );
+    } on LinkClosedError catch (e) {
+      // A send that lands on a link the peer has just torn down is the same
+      // event as a read that ends: the pairing was abandoned. Surfacing the
+      // transport error raw would make callers, and the UI above them, treat
+      // an ordinary decline as an internal fault.
+      throw PairingRejectedError('the pairing link closed mid-exchange: $e');
     } finally {
       await inbox.cancel();
     }
