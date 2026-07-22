@@ -163,6 +163,24 @@ class OmniFiHandshakeV1 implements Handshake {
     );
   }
 
+  /// Extracts the sender's device ID from a handshake message.
+  static String deviceIdFromMessage(List<int> message) {
+    final Object? decoded;
+    try {
+      decoded = cbor.decode(message).toObject();
+    } catch (_) {
+      throw const HandshakeError('handshake message is not valid CBOR');
+    }
+    if (decoded is! Map) {
+      throw const HandshakeError('handshake message is not a map');
+    }
+    final id = decoded['id'];
+    if (id is! String || id.isEmpty) {
+      throw const HandshakeError('handshake message has no device id');
+    }
+    return id;
+  }
+
   @override
   Future<Uint8List> start() async {
     if (_started) {
@@ -351,6 +369,27 @@ class OmniFiHandshakeV1 implements Handshake {
     _derived = result;
     _derivedFrom = peer;
     return result;
+  }
+
+  /// The short-authentication-string inputs — the master secret and the
+  /// peer's static public key *as learned from* [peerMessage] — available
+  /// before the peer's key confirmation has been verified.
+  ///
+  /// Pairing needs this. When the pre-shared key is wrong — a mistyped code,
+  /// or a man-in-the-middle who relayed a different invite — the two sides
+  /// derive different masters, so the key confirmation *cannot* verify. The
+  /// honest failure mode there is two screens showing different words, which
+  /// is exactly what the user is asked to catch; failing with an opaque
+  /// exception before the words are ever shown would hide the attack rather
+  /// than surface it.
+  ///
+  /// No key material and no session is returned here: [complete] remains the
+  /// only way to obtain a key-confirmed [AeadSession], and a caller that
+  /// wants to send data must still call it and honour its failure.
+  Future<({List<int> master, List<int> peerStaticPublicKey})> sasInputsFor(
+      List<int> peerMessage) async {
+    final d = await _derive(peerMessage);
+    return (master: d.master, peerStaticPublicKey: d.peerStaticPublicKey);
   }
 
   @override

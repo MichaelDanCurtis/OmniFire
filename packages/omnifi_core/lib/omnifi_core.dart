@@ -17,3 +17,4 @@ export 'src/transport/outbox.dart';
 export 'src/transport/link_manager.dart';
 export 'src/session/peer_session.dart';
 export 'src/pairing/pairing_payload.dart';
+export 'src/pairing/pairing_flow.dart';
