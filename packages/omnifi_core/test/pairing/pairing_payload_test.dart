@@ -67,6 +67,19 @@ void main() {
         throwsA(isA<PairingError>()));
   });
 
+  test('rejects a malformed percent-escape in the relay hint', () {
+    // Uri.parse does not validate percent-encoding; the FormatException is
+    // thrown lazily from queryParameters, which decodes every value eagerly
+    // -- not just the one being read. A malformed escape in the
+    // unconstrained relay-hint field must still surface as PairingError.
+    final meshId = 'a' * 32;
+    expect(
+      () => decodeInviteUri(
+          'omnifi://pair?m=$meshId&k=AAAA&p=AAAA&r=%ff%fe'),
+      throwsA(isA<PairingError>()),
+    );
+  });
+
   test('word code is 8 words from the wordlist', () {
     final words = encodeInviteWords(sample());
     expect(words.length, 8);
@@ -115,6 +128,88 @@ void main() {
   test('word decode rejects the wrong word count', () {
     expect(
       () => decodeInviteWords(['able', 'brisk'], lookup: (_) => sample()),
+      throwsA(isA<PairingError>()),
+    );
+  });
+
+  group('relay hint validation', () {
+    PairingInvite withHint(String? hint) => PairingInvite(
+          meshId: 'a' * 32,
+          inviterPublicKey: List<int>.filled(32, 3),
+          psk: List<int>.filled(32, 9),
+          relayHint: hint,
+        );
+
+    test('rejects a javascript: scheme', () {
+      expect(() => withHint('javascript:alert(1)'),
+          throwsA(isA<PairingError>()));
+    });
+
+    test('rejects a hostless URI', () {
+      expect(() => withHint('https:///no-host-path'),
+          throwsA(isA<PairingError>()));
+    });
+
+    test('rejects a hint over 256 characters', () {
+      final longHint = 'https://arc.example.com/${'a' * 300}';
+      expect(() => withHint(longHint), throwsA(isA<PairingError>()));
+    });
+
+    test('rejects an unparseable hint', () {
+      expect(
+          () => withHint('https://[::1'), throwsA(isA<PairingError>()));
+    });
+
+    test('accepts a legitimate https hint and round-trips it', () {
+      final invite = withHint('https://arc.example.com');
+      expect(invite.relayHint, 'https://arc.example.com');
+      final back = decodeInviteUri(encodeInviteUri(invite));
+      expect(back.relayHint, 'https://arc.example.com');
+    });
+
+    test('accepts a wss hint and round-trips it', () {
+      final invite = withHint('wss://relay.example.com');
+      expect(invite.relayHint, 'wss://relay.example.com');
+      final back = decodeInviteUri(encodeInviteUri(invite));
+      expect(back.relayHint, 'wss://relay.example.com');
+    });
+
+    test('accepts a null hint', () {
+      expect(withHint(null).relayHint, isNull);
+    });
+
+    test('rejects an invalid relay hint reached through decodeInviteUri',
+        () {
+      // The constructor is the single construction path for PairingInvite,
+      // so a hostile QR payload carrying a rejected relay hint is caught
+      // here too, not just via the direct constructor. Uses otherwise-valid
+      // mesh id/key/psk so the failure is attributable to the relay hint,
+      // not to an incidentally wrong-length key.
+      final withValidHint = encodeInviteUri(withHint('https://arc.example.com'));
+      final withBadHint = withValidHint.replaceAll(
+          RegExp(r'r=[^&]*'), 'r=javascript%3Aalert(1)');
+      expect(() => decodeInviteUri(withBadHint), throwsA(isA<PairingError>()));
+    });
+  });
+
+  test('rejects a wrong-length psk', () {
+    final bad = encodeInviteUri(sample()).replaceAll(
+        RegExp(r'p=[^&]*'), 'p=AAAA');
+    expect(() => decodeInviteUri(bad), throwsA(isA<PairingError>()));
+  });
+
+  test('rejects a correct scheme with the wrong host', () {
+    final meshId = 'a' * 32;
+    expect(
+      () => decodeInviteUri('omnifi://notpair?m=$meshId&k=AAAA&p=AAAA'),
+      throwsA(isA<PairingError>()),
+    );
+  });
+
+  test('rejects malformed base64url via the base64Url.decode path', () {
+    final meshId = 'a' * 32;
+    expect(
+      () => decodeInviteUri('omnifi://pair?m=$meshId&k=!!!!&p=AAAA'),
       throwsA(isA<PairingError>()),
     );
   });

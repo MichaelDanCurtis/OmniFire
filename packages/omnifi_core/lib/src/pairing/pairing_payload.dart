@@ -26,6 +26,29 @@ class PairingInvite {
     if (psk.length != 32) {
       throw const PairingError('psk must be 32 bytes');
     }
+    final hint = relayHint;
+    if (hint != null) {
+      if (hint.length > 256) {
+        throw const PairingError('relay hint must be at most 256 characters');
+      }
+      final Uri hintUri;
+      try {
+        hintUri = Uri.parse(hint);
+      } on FormatException {
+        throw const PairingError('relay hint is not a parseable URI');
+      }
+      if (!hintUri.isAbsolute) {
+        throw const PairingError('relay hint must be an absolute URI');
+      }
+      const allowedSchemes = {'http', 'https', 'ws', 'wss'};
+      if (!allowedSchemes.contains(hintUri.scheme)) {
+        throw const PairingError(
+            'relay hint scheme must be one of http, https, ws, wss');
+      }
+      if (hintUri.host.isEmpty) {
+        throw const PairingError('relay hint must have a non-empty host');
+      }
+    }
   }
 
   final String meshId;
@@ -74,9 +97,22 @@ PairingInvite decodeInviteUri(String uri) {
     throw const PairingError('invite is not an omnifi://pair URI');
   }
 
-  final meshId = parsed.queryParameters['m'];
-  final key = parsed.queryParameters['k'];
-  final psk = parsed.queryParameters['p'];
+  // Uri.parse does not validate percent-encoding: it is checked lazily the
+  // first time queryParameters is read, and that single read eagerly
+  // decodes every value in the query -- not just the one being accessed.
+  // A malformed escape anywhere in the query (most easily reached via the
+  // unconstrained relay-hint field) must not escape as a raw
+  // FormatException, so the access is guarded here.
+  final Map<String, String> queryParameters;
+  try {
+    queryParameters = parsed.queryParameters;
+  } on FormatException {
+    throw const PairingError('invite query could not be decoded');
+  }
+
+  final meshId = queryParameters['m'];
+  final key = queryParameters['k'];
+  final psk = queryParameters['p'];
   if (meshId == null || key == null || psk == null) {
     throw const PairingError('invite is missing a required parameter');
   }
