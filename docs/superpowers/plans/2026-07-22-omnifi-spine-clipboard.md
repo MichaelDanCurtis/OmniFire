@@ -589,7 +589,7 @@ Mutual authentication holds because only the holder of `s_responder` can compute
     - `Future<Uint8List> start()` — returns the local handshake message
     - `Future<Uint8List> confirmationFor(List<int> peerMessage)`
     - `Future<HandshakeResult> complete(List<int> peerMessage, List<int> peerConfirmation)`
-  - `class OmniFiHandshakeV1 implements Handshake` with named constructors `.initiator(...)` and `.responder(...)`, each taking `{required StaticKeyPair staticKeys, required String deviceId, List<int>? expectedPeerStaticPublicKey, List<int> psk = const []}`
+  - `class OmniFiHandshakeV1 implements Handshake` with named constructors `.initiator(...)` and `.responder(...)`, each taking `{required StaticKeyPair staticKeys, required String deviceId, required List<int>? expectedPeerStaticPublicKey, List<int> psk = const []}` — the peer-key parameter is **`required` but nullable**: callers must type `null` explicitly to opt out of mutual authentication, so dropping it can never be the shortest call that compiles. A configuration with both a null expectation and an empty PSK has no authentication mechanism at all and must throw.
   - `class HandshakeError implements Exception`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1092,21 +1092,114 @@ git commit -m "test: pin AEAD wire format with known-answer vectors"
 **Interfaces:**
 - Consumes: nothing beyond the SDK and `cryptography`.
 - Produces:
-  - `const List<String> omnifiWordlist = [
-  'able', 'brisk', 'cedar', 'acid', 'acorn', 'actor', 'adapt', 'admit',
-  'adopt', 'agent', 'agree', 'ahead', 'alarm', 'album', 'alert', 'alien',
-  'align', 'alive', 'alley', 'alloy', 'alone', 'alpha', 'amber', 'ample',
-  'anchor', 'angel', 'anger', 'angle', 'ankle', 'apple', 'apron', 'arbor',
-  'arena', 'argue', 'arise', 'armor', 'arrow', 'aspen', 'asset', 'atlas',
-  'audio', 'audit', 'aunt', 'avoid', 'awake', 'award', 'aware', 'bacon',
-  'badge', 'bagel', 'baker', 'balmy', 'banjo', 'barge', 'basil', 'basin',
-  'batch', 'beach', 'beacon', 'beard', 'beast', 'bench', 'berry', 'birch',
-  'bison', 'blade', 'blaze', 'blend', 'bliss', 'block', 'bloom', 'blue',
-  'blunt', 'board', 'bonus', 'boost', 'booth', 'brace', 'braid', 'brain',
-  'brand', 'brave', 'bread', 'break', 'brick', 'bride', 'brief', 'bring',
-  'broad', 'bronze', 'brook', 'brush', 'buddy', 'bugle', 'build', 'bunch',
-  'bunny', 'burst', 'cabin', 'cable', 'cache', 'cadet', 'camel', 'canal',
-  'candy', 'canoe', 'canyon', 'carbon', 'cargo', 'carol', 'carve', 'catch',
+  - `const List<String> omnifiWordlist` — exactly 256 lowercase words, unique, 3–7 letters each.
+  - `Future<List<String>> deriveSas({required List<int> master, required List<int> initiatorStaticPublicKey, required List<int> responderStaticPublicKey, int words = 5})`
+  - `String formatSas(List<String> words)` — joins with `' '`.
+
+The SAS is derived from the handshake master secret **and both static public keys**, so an attacker who inserts themselves produces a different SAS on each side, which the user sees as a mismatch.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `packages/omnifi_core/test/crypto/sas_test.dart`:
+
+```dart
+import 'package:omnifi_core/omnifi_core.dart';
+import 'package:test/test.dart';
+
+void main() {
+  test('wordlist has exactly 256 unique words', () {
+    expect(omnifiWordlist.length, 256);
+    expect(omnifiWordlist.toSet().length, 256);
+  });
+
+  test('wordlist entries are lowercase and 3-7 letters', () {
+    for (final w in omnifiWordlist) {
+      expect(w, matches(RegExp(r'^[a-z]{3,7}$')), reason: 'bad word: $w');
+    }
+  });
+
+  test('derives the requested number of words', () async {
+    final sas = await deriveSas(
+      master: List<int>.filled(32, 3),
+      initiatorStaticPublicKey: List<int>.filled(32, 1),
+      responderStaticPublicKey: List<int>.filled(32, 2),
+    );
+    expect(sas.length, 5);
+    for (final w in sas) {
+      expect(omnifiWordlist, contains(w));
+    }
+  });
+
+  test('is deterministic for the same inputs', () async {
+    Future<List<String>> go() => deriveSas(
+          master: List<int>.filled(32, 3),
+          initiatorStaticPublicKey: List<int>.filled(32, 1),
+          responderStaticPublicKey: List<int>.filled(32, 2),
+        );
+    expect(await go(), await go());
+  });
+
+  test('differs when the master secret differs', () async {
+    final a = await deriveSas(
+      master: List<int>.filled(32, 3),
+      initiatorStaticPublicKey: List<int>.filled(32, 1),
+      responderStaticPublicKey: List<int>.filled(32, 2),
+    );
+    final b = await deriveSas(
+      master: List<int>.filled(32, 4),
+      initiatorStaticPublicKey: List<int>.filled(32, 1),
+      responderStaticPublicKey: List<int>.filled(32, 2),
+    );
+    expect(a, isNot(equals(b)));
+  });
+
+  test('differs when a static key differs (MITM detection)', () async {
+    final honest = await deriveSas(
+      master: List<int>.filled(32, 3),
+      initiatorStaticPublicKey: List<int>.filled(32, 1),
+      responderStaticPublicKey: List<int>.filled(32, 2),
+    );
+    final mitm = await deriveSas(
+      master: List<int>.filled(32, 3),
+      initiatorStaticPublicKey: List<int>.filled(32, 1),
+      responderStaticPublicKey: List<int>.filled(32, 9),
+    );
+    expect(honest, isNot(equals(mitm)));
+  });
+
+  test('formats as space-separated words', () {
+    expect(formatSas(['able', 'brisk', 'cedar']), 'able brisk cedar');
+  });
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd packages/omnifi_core && dart test test/crypto/sas_test.dart`
+Expected: FAIL — `omnifiWordlist isn't defined`.
+
+- [ ] **Step 3: Create the wordlist**
+
+Create `packages/omnifi_core/lib/src/crypto/wordlist.dart`. It must contain exactly 256 unique lowercase words of 3–7 letters. Use this list verbatim:
+
+```dart
+/// 256 words for short authentication strings and pairing phrases.
+/// Chosen to be short, common, and phonetically distinct when read aloud.
+const List<String> omnifiWordlist = [
+  'able', 'acid', 'acorn', 'actor', 'adapt', 'admit', 'adopt', 'agent',
+  'agree', 'ahead', 'alarm', 'album', 'alert', 'alien', 'align', 'alive',
+  'alley', 'alloy', 'alone', 'alpha', 'amber', 'ample', 'anchor', 'angel',
+  'anger', 'angle', 'ankle', 'apple', 'apron', 'arbor', 'arena', 'argue',
+  'arise', 'armor', 'arrow', 'aspen', 'asset', 'atlas', 'audio', 'audit',
+  'aunt', 'avoid', 'awake', 'award', 'aware', 'bacon', 'badge', 'bagel',
+  'baker', 'balmy', 'banjo', 'barge', 'basil', 'basin', 'batch', 'beach',
+  'beacon', 'beard', 'beast', 'bench', 'berry', 'birch', 'bison', 'blade',
+  'blaze', 'blend', 'bliss', 'block', 'bloom', 'blue', 'blunt', 'board',
+  'bonus', 'boost', 'booth', 'brace', 'braid', 'brain', 'brand', 'brave',
+  'bread', 'break', 'brick', 'bride', 'brief', 'bring', 'brisk', 'broad',
+  'bronze', 'brook', 'brush', 'buddy', 'bugle', 'build', 'bunch', 'bunny',
+  'burst', 'cabin', 'cable', 'cache', 'cadet', 'camel', 'canal', 'candy',
+  'canoe', 'canyon', 'carbon', 'cargo', 'carol', 'carve', 'catch', 'cedar',
   'chain', 'chair', 'chalk', 'charm', 'chase', 'cheer', 'chess', 'chief',
   'chill', 'chime', 'chirp', 'chord', 'cider', 'cinema', 'civic', 'claim',
   'clamp', 'clash', 'clasp', 'clean', 'clear', 'cliff', 'climb', 'cloak',
