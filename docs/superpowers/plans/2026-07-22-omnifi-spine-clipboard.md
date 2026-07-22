@@ -1991,12 +1991,26 @@ Future<DeviceIdentity> loadOrCreateIdentity({
   final existingPriv = await store.read(_kPrivateKey);
   final existingPub = await store.read(_kPublicKey);
 
-  if (existingId != null && existingPriv != null && existingPub != null) {
+  final present = [existingId, existingPriv, existingPub].where((v) => v != null).length;
+
+  // Partial state must fail loudly. Falling through to the create branch here
+  // would silently mint a NEW identity for a device that already has one --
+  // orphaning it from every peer it had paired with, with no error shown. A
+  // crash midway through first-run persistence, a partial keychain eviction,
+  // or a migration bug all produce this state.
+  if (present != 0 && present != 3) {
+    throw const IdentityError(
+        'stored identity is incomplete; refusing to regenerate and orphan '
+        'this device from its mesh. Restore the keychain entry, or delete '
+        'all of omnifi.identity.* to deliberately re-pair as a new device.');
+  }
+
+  if (present == 3) {
     final List<int> priv;
     final List<int> pub;
     try {
-      priv = base64Decode(existingPriv);
-      pub = base64Decode(existingPub);
+      priv = base64Decode(existingPriv!);
+      pub = base64Decode(existingPub!);
     } on FormatException {
       throw const IdentityError('stored key material is not valid base64');
     }
@@ -2005,7 +2019,7 @@ Future<DeviceIdentity> loadOrCreateIdentity({
     }
     await store.write(_kDisplayName, displayName);
     return DeviceIdentity(
-      deviceId: existingId,
+      deviceId: existingId!,
       displayName: displayName,
       keys: StaticKeyPair(publicKey: pub, privateKey: priv),
     );
