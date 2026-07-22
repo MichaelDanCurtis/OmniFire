@@ -26,6 +26,7 @@
 - The relay MUST NOT be able to decrypt any payload. It routes by mesh ID and device ID only.
 - Every commit message uses Conventional Commits (`feat:`, `test:`, `fix:`, `chore:`, `docs:`).
 - Run `dart analyze` before every commit in Dart packages; it must report zero issues.
+- **Two relay backends exist and must stay contract-identical:** the Cloudflare Worker (Task 18) and an ARC route (Task 27). Any change to the relay wire contract must land in both, and the Task 19 integration suite must be run against both before either is considered done. The client treats them as competing candidate links, not as a primary and a failover — see Task 21's `EngineConfig.relayBases`.
 
 ---
 
@@ -5594,7 +5595,11 @@ class RelayLink implements Link {
         (channelFactory ?? WebSocketChannel.connect)(uri);
     await channel.ready.timeout(timeout);
     return RelayLink._(
-      id: 'relay:$peerDeviceId',
+      // The host is part of the id because two relay backends (Cloudflare
+      // and ARC) can be dialed for the same peer simultaneously. A bare
+      // 'relay:<peer>' would collide in LinkManager's candidate map and
+      // one backend would silently evict the other.
+      id: 'relay:${relayBase.host}:$peerDeviceId',
       channel: channel,
       peerDeviceId: peerDeviceId,
     );
@@ -6281,7 +6286,7 @@ Before any Flutter code, the composition of identity + mesh + sessions + links +
 **Interfaces:**
 - Consumes: everything from Tasks 3–20.
 - Produces:
-  - `class EngineConfig { final Uri relayBase; final String displayName; final bool lanEnabled; }`
+  - `class EngineConfig { final List<Uri> relayBases; final String displayName; final bool lanEnabled; }` — `relayBases` is every relay backend to dial, in descending preference order. All are dialed concurrently as competing candidate links.
   - `class OmniFiEngine` with:
     - `static Future<OmniFiEngine> create({required SecureStore store, required ClipboardWatcher watcher, required EngineConfig config, int Function()? clock})`
     - `DeviceIdentity get identity`, `Mesh get mesh`
@@ -6305,7 +6310,7 @@ import 'package:omnifi_core/omnifi_core.dart';
 import 'package:test/test.dart';
 
 EngineConfig config({bool lan = false}) => EngineConfig(
-      relayBase: Uri.parse('http://localhost:8787'),
+      relayBases: [Uri.parse('http://localhost:8787')],
       displayName: 'Test Device',
       lanEnabled: lan,
     );
@@ -6498,13 +6503,24 @@ import '../transport/relay_link.dart';
 
 class EngineConfig {
   const EngineConfig({
-    required this.relayBase,
+    required this.relayBases,
     required this.displayName,
     this.lanEnabled = true,
   });
-  final Uri relayBase;
+
+  /// Every relay backend to dial, in descending order of preference.
+  /// All of them are dialed concurrently and treated as competing
+  /// candidate links; whichever answers first with the lowest RTT wins.
+  /// There is no explicit failover logic because there does not need to
+  /// be — [LinkManager] already ranks candidates, and a relay that is
+  /// down simply never becomes a candidate.
+  final List<Uri> relayBases;
+
   final String displayName;
   final bool lanEnabled;
+
+  /// Convenience for the common single-relay case.
+  Uri get primaryRelay => relayBases.first;
 }
 
 /// Composition root. Everything the UI needs hangs off this one object.
@@ -6586,7 +6602,7 @@ class OmniFiEngine {
   PairingInvite buildInvite() => generateInvite(
         meshId: mesh.meshId,
         inviterPublicKey: identity.keys.publicKey,
-        relayHint: config.relayBase.toString(),
+        relayHint: config.primaryRelay.toString(),
       );
 
   Future<void> persist() => saveMesh(mesh, _store);
@@ -6627,13 +6643,18 @@ class OmniFiEngine {
     final manager = LinkManager(
       session: session,
       clock: _clock,
+      // One dialer per configured relay backend. Two relays are two
+      // candidate links, not a primary plus a failover path: LinkManager
+      // already prefers LAN over any relay, and ranks relays against each
+      // other by measured RTT. Adding a backend costs one list entry.
       dialers: [
-        () => RelayLink.connect(
-              relayBase: config.relayBase,
-              meshId: mesh.meshId,
-              localDeviceId: identity.deviceId,
-              peerDeviceId: peer.deviceId,
-            ),
+        for (final relayBase in config.relayBases)
+          () => RelayLink.connect(
+                relayBase: relayBase,
+                meshId: mesh.meshId,
+                localDeviceId: identity.deviceId,
+                peerDeviceId: peer.deviceId,
+              ),
       ],
     );
     _managers[peer.deviceId] = manager;
@@ -7653,12 +7674,19 @@ Future<void> main() async {
     store: PlatformSecureStore(),
     watcher: PlatformClipboardWatcher(),
     config: EngineConfig(
-      relayBase: Uri.parse(
-        const String.fromEnvironment(
+      // Cloudflare first, ARC second. Both are dialed; the faster one wins.
+      // A relay that is down never becomes a candidate link, so an outage
+      // on either backend is invisible to the user.
+      relayBases: [
+        Uri.parse(const String.fromEnvironment(
           'OMNIFI_RELAY',
           defaultValue: 'https://omnifi-relay.workers.dev',
-        ),
-      ),
+        )),
+        Uri.parse(const String.fromEnvironment(
+          'OMNIFI_RELAY_FALLBACK',
+          defaultValue: 'https://arc.ailuxis.com',
+        )),
+      ],
       displayName: 'OmniFi Device',
     ),
   );
@@ -8566,3 +8594,398 @@ Two consistency fixes applied inline while reviewing:
 2. `FakeLink` was promoted from `test/support/` into the library as `FakeLinkFactory` in Task 21, because the engine test and the app's tests both need it. The old path re-exports it so Tasks 11–20 tests keep compiling unchanged.
 
 **Scope check.** This plan covers exactly project 1 of the four in the spec. Projects 2–4 (iMessage, audio, video) are excluded and each need their own spec → plan cycle.
+
+---
+
+## Task 27: ARC mesh relay route (second relay backend)
+
+Added after the plan's first draft, when it emerged that a production Rust relay (`arc-relay`) already exists and is deployed. The decision was to run **both** backends: Cloudflare as the default, ARC as an equal-standing second candidate. `LinkManager` already races dialers and ranks by preference score, so this needs no new client failover logic — only a second entry in `EngineConfig.relayBases`.
+
+**This task's code lives in a different repository.** ARC is at `/Volumes/Main External/Development/ARC` (a Rust workspace, `arc-relay` crate, axum + sqlx). Commit there, not in the OmniFi repo. Verify the ARC checkout is clean before starting, and do not touch `mirror/`, `ws/`, `auth/`, or any existing route.
+
+**Files:**
+- Create: `arc-relay/src/mesh/mod.rs`
+- Create: `arc-relay/src/mesh/registry.rs`
+- Create: `arc-relay/src/mesh/routes.rs`
+- Create: `arc-relay/tests/mesh_relay.rs`
+- Modify: `arc-relay/src/lib.rs` (add `pub mod mesh;`)
+- Modify: `arc-relay/src/api/mod.rs` (mount the router)
+
+**Interfaces:**
+- Consumes: nothing from ARC's existing modules. Explicitly **not** `AppState`'s database pool, `auth::jwt`, `beacon_proto`, or `mirror::`.
+- Produces a network contract **byte-identical to Task 18's**:
+  - `GET /v1/mesh/:meshId/ws?device=:deviceId` with `Upgrade: websocket` → 101.
+  - Binary frames only. First 16 bytes = destination device ID as raw bytes (32 hex chars decoded), or 16 zero bytes for broadcast. Remainder is opaque and forwarded verbatim.
+  - HTTP `400` **before upgrade** on a malformed mesh ID or device ID (both must match `^[0-9a-f]{32}$`).
+  - HTTP `426` on a non-upgrade request to the ws path.
+  - Close `1009` on a frame over 1_048_576 bytes.
+  - `GET /v1/mesh/health` → `200 {"ok":true}`. (Namespaced under `/v1/mesh` to avoid colliding with ARC's existing health route.)
+
+### Design constraints — these are the point of the task
+
+**The route is deliberately unauthenticated and stateless.** It must not require a JWT, must not read or write Postgres, and must not construct a `SessionMirror`. OmniFi's design has no accounts by deliberate choice; routing through ARC's authenticated path would reverse that. The mesh ID is a 128-bit random capability and is the only credential.
+
+**It must not use `beacon_proto` envelopes.** ARC's existing fanout carries typed `ArcToClient` values. This route forwards opaque ciphertext byte-for-byte. If it ever deserializes a payload, it is wrong.
+
+**It needs the abuse protections a Durable Object gave for free.** Unlike Cloudflare, this route sits on a single public VPS with no platform-level DDoS absorption. Enforce, in `registry.rs`:
+- at most **16** concurrent sockets per mesh (reject the 17th with close `1013`),
+- at most **1024** concurrent meshes process-wide (reject with HTTP `503`),
+- a per-socket token bucket of **50 frames/second, burst 100** (exceeding it closes with `1008`),
+- a mesh entry is dropped from the registry the moment its last socket disconnects, so an idle mesh holds no memory.
+
+These numbers are generous for a personal mesh of 2–6 devices and cheap to enforce; their purpose is to bound a hostile or buggy client, not to shape normal traffic.
+
+- [ ] **Step 1: Verify the ARC checkout is clean and builds**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+git status --short
+cargo build -p arc-relay 2>&1 | tail -5
+```
+
+Expected: a clean working tree and a successful build. If the tree is dirty, STOP and report — do not commit alongside someone else's in-progress work.
+
+- [ ] **Step 2: Write the failing integration test**
+
+Create `arc-relay/tests/mesh_relay.rs`:
+
+```rust
+//! Conformance tests for the OmniFi mesh relay route.
+//!
+//! These mirror the Cloudflare Worker's test suite one-for-one. The two
+//! backends must stay contract-identical; if you change an assertion here,
+//! change it in `relay/test/mesh_do.test.ts` in the OmniFi repo too.
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+mod common;
+
+const MESH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const DEV_A: &str = "11111111111111111111111111111111";
+const DEV_B: &str = "22222222222222222222222222222222";
+
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+fn frame(dest: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + body.len());
+    out.extend_from_slice(dest);
+    out.extend_from_slice(body);
+    out
+}
+
+fn broadcast() -> Vec<u8> {
+    vec![0u8; 16]
+}
+
+#[tokio::test]
+async fn health_reports_ok() {
+    let server = common::spawn_mesh_server().await;
+    let body: serde_json::Value = reqwest::get(format!("{}/v1/mesh/health", server.http_base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body, serde_json::json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn rejects_malformed_mesh_id() {
+    let server = common::spawn_mesh_server().await;
+    let res = reqwest::get(format!(
+        "{}/v1/mesh/NOT-HEX/ws?device={DEV_A}",
+        server.http_base
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test]
+async fn rejects_malformed_device_id() {
+    let server = common::spawn_mesh_server().await;
+    let res = reqwest::get(format!(
+        "{}/v1/mesh/{MESH}/ws?device=nope",
+        server.http_base
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test]
+async fn rejects_non_upgrade_request() {
+    let server = common::spawn_mesh_server().await;
+    let res = reqwest::get(format!(
+        "{}/v1/mesh/{MESH}/ws?device={DEV_A}",
+        server.http_base
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 426);
+}
+
+#[tokio::test]
+async fn routes_directed_frame_to_addressed_device_only() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    a.send(Message::Binary(frame(&hex_to_bytes(DEV_B), b"ciphertext")))
+        .await
+        .unwrap();
+
+    let got = b.next().await.unwrap().unwrap();
+    assert_eq!(&got.into_data()[16..], b"ciphertext");
+}
+
+#[tokio::test]
+async fn broadcasts_to_every_peer_except_sender() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    a.send(Message::Binary(frame(&broadcast(), b"to everyone")))
+        .await
+        .unwrap();
+
+    let got = b.next().await.unwrap().unwrap();
+    assert_eq!(&got.into_data()[16..], b"to everyone");
+}
+
+#[tokio::test]
+async fn does_not_deliver_across_meshes() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut other = server
+        .connect("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", DEV_B)
+        .await;
+
+    a.send(Message::Binary(frame(&broadcast(), b"mesh-local")))
+        .await
+        .unwrap();
+
+    let timeout =
+        tokio::time::timeout(std::time::Duration::from_millis(200), other.next()).await;
+    assert!(timeout.is_err(), "frame leaked across meshes");
+}
+
+#[tokio::test]
+async fn drops_frame_shorter_than_header() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    a.send(Message::Binary(vec![0u8; 8])).await.unwrap();
+
+    let timeout = tokio::time::timeout(std::time::Duration::from_millis(200), b.next()).await;
+    assert!(timeout.is_err(), "short frame was forwarded");
+}
+
+#[tokio::test]
+async fn closes_on_oversized_frame() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+
+    a.send(Message::Binary(vec![0u8; 1_048_576 + 32]))
+        .await
+        .unwrap();
+
+    let closed = a.next().await;
+    match closed {
+        Some(Ok(Message::Close(Some(f)))) => assert_eq!(u16::from(f.code), 1009),
+        other => panic!("expected close 1009, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn accepts_a_frame_exactly_at_the_cap() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    let mut body = vec![0u8; 1_048_576 - 16];
+    body[0] = 42;
+    a.send(Message::Binary(frame(&hex_to_bytes(DEV_B), &body)))
+        .await
+        .unwrap();
+
+    let got = b.next().await.unwrap().unwrap();
+    assert_eq!(got.into_data().len(), 1_048_576);
+}
+
+#[tokio::test]
+async fn rejects_the_seventeenth_socket_in_one_mesh() {
+    let server = common::spawn_mesh_server().await;
+    let mut sockets = Vec::new();
+    for i in 0..16 {
+        sockets.push(server.connect(MESH, &format!("{:032x}", i)).await);
+    }
+    let mut overflow = server.connect(MESH, &format!("{:032x}", 99)).await;
+    match overflow.next().await {
+        Some(Ok(Message::Close(Some(f)))) => assert_eq!(u16::from(f.code), 1013),
+        other => panic!("expected close 1013, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_is_dropped_when_its_last_socket_leaves() {
+    let server = common::spawn_mesh_server().await;
+    {
+        let mut a = server.connect(MESH, DEV_A).await;
+        a.close(None).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(server.registry.mesh_count(), 0);
+}
+```
+
+- [ ] **Step 3: Write the test harness**
+
+Create `arc-relay/tests/common/mod.rs`:
+
+```rust
+//! Spawns the mesh router alone — no database, no JWT, no AppState — which
+//! is itself a check that the route has no hidden dependency on either.
+
+use arc_relay::mesh::{registry::MeshRegistry, routes::mesh_router};
+use tokio::net::TcpListener;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+pub struct TestServer {
+    pub http_base: String,
+    pub ws_base: String,
+    pub registry: MeshRegistry,
+}
+
+impl TestServer {
+    pub async fn connect(
+        &self,
+        mesh: &str,
+        device: &str,
+    ) -> WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+        let url = format!("{}/v1/mesh/{mesh}/ws?device={device}", self.ws_base);
+        let (stream, _) = connect_async(url).await.expect("ws connect failed");
+        stream
+    }
+}
+
+pub async fn spawn_mesh_server() -> TestServer {
+    let registry = MeshRegistry::new();
+    let app = mesh_router(registry.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    TestServer {
+        http_base: format!("http://{addr}"),
+        ws_base: format!("ws://{addr}"),
+        registry,
+    }
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+cargo test -p arc-relay --test mesh_relay 2>&1 | tail -20
+```
+
+Expected: compilation failure — `arc_relay::mesh` does not exist.
+
+- [ ] **Step 5: Write the registry**
+
+Create `arc-relay/src/mesh/registry.rs` implementing:
+
+```rust
+//! In-memory mesh registry for the OmniFi relay route.
+//!
+//! Deliberately has no database, no auth, and no knowledge of payload
+//! contents. A mesh is a set of connected sockets keyed by a 128-bit
+//! random mesh ID; the ID is the only credential, and the relay cannot
+//! read anything it forwards.
+```
+
+Requirements, all enforced here rather than in the route handler:
+- `MeshRegistry` is `Clone` and `Arc`-backed (follow the pattern `mirror::MirrorRegistry` uses, but share no code with it).
+- `pub fn new() -> Self`, `pub fn mesh_count(&self) -> usize`.
+- `join(mesh_id, device_id) -> Result<MeshHandle, JoinRejection>` where `JoinRejection` distinguishes `MeshFull` (→ close 1013) from `TooManyMeshes` (→ HTTP 503).
+- Each connected socket gets an `mpsc::Sender<Vec<u8>>` for outbound frames.
+- `forward(mesh_id, from_device, frame)` sends the frame verbatim to the addressed device, or to every device except the sender when the first 16 bytes are zero. It must never copy or re-encode the body.
+- Dropping the last `MeshHandle` in a mesh removes the mesh entry — implement `Drop` so this cannot be forgotten by a caller.
+- Constants: `MAX_SOCKETS_PER_MESH = 16`, `MAX_MESHES = 1024`, `MAX_FRAME_BYTES = 1_048_576`, `RATE_LIMIT_FRAMES_PER_SEC = 50`, `RATE_LIMIT_BURST = 100`.
+
+- [ ] **Step 6: Write the routes**
+
+Create `arc-relay/src/mesh/routes.rs` with `pub fn mesh_router(registry: MeshRegistry) -> axum::Router` exposing `GET /v1/mesh/health` and `GET /v1/mesh/:mesh_id/ws`.
+
+The handler must, in this order: validate the mesh ID against `^[0-9a-f]{32}$` (400 on failure), validate the `device` query parameter the same way (400), confirm the request carries a WebSocket upgrade (426 otherwise), then attempt `registry.join` (503 on `TooManyMeshes`), and only then accept the upgrade. On `MeshFull`, accept the upgrade and immediately close with 1013 — a close code is only reachable once a socket exists, which is the same reasoning that put the ID validation before the upgrade rather than after.
+
+Create `arc-relay/src/mesh/mod.rs`:
+
+```rust
+pub mod registry;
+pub mod routes;
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+cargo test -p arc-relay --test mesh_relay 2>&1 | tail -20
+```
+
+Expected: 13 passed.
+
+- [ ] **Step 8: Verify the route has no hidden dependencies**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+grep -rnE "sqlx|jwt|beacon_proto|AppState|mirror::" arc-relay/src/mesh/ && echo "FAIL: mesh route touched a forbidden module" || echo "OK: mesh route is standalone"
+```
+
+Expected: `OK: mesh route is standalone`.
+
+- [ ] **Step 9: Mount the router and confirm the whole crate still builds**
+
+Add `pub mod mesh;` to `arc-relay/src/lib.rs`, and merge `mesh_router` into the main router in `arc-relay/src/api/mod.rs` without applying any auth middleware to it.
+
+```bash
+cargo build -p arc-relay && cargo test -p arc-relay 2>&1 | tail -15
+```
+
+Expected: the build succeeds and ARC's pre-existing test suite still passes. If any pre-existing test fails, report it — do not fix unrelated failures inside this task.
+
+- [ ] **Step 10: Commit in the ARC repository**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+git add arc-relay/src/mesh arc-relay/tests/mesh_relay.rs arc-relay/tests/common arc-relay/src/lib.rs arc-relay/src/api/mod.rs
+git commit -m "feat(mesh): add unauthenticated OmniFi mesh relay route"
+```
+
+- [ ] **Step 11: Record the deployment prerequisite**
+
+This task does **not** deploy. Note in the report that `arc.ailuxis.com` must be redeployed (per ARC's `deploy/release.sh`) before OmniFi clients can reach the ARC backend, and that until then `EngineConfig.relayBases` should list only the Cloudflare URL.
+
+---
+
+## Amendment log
+
+Changes made to this plan after its first draft, with the reason each was made.
+
+| Date | Change | Reason |
+|---|---|---|
+| 2026-07-22 | Task 18's contract changed from "close 1008 on a malformed mesh or device ID" to "HTTP 400 before upgrade" | The plan's prose contradicted its own tests. A malformed ID is caught before the WebSocket upgrade completes, so no socket exists to close. Decided by the project owner. |
+| 2026-07-22 | `RelayLink.id` changed from `relay:<peer>` to `relay:<host>:<peer>` | Two relay backends dialed for the same peer would collide in `LinkManager`'s candidate map, silently evicting one. |
+| 2026-07-22 | `EngineConfig.relayBase` → `relayBases` (a list); engine builds one dialer per entry | Second relay backend adopted (ARC). Needs no new failover logic — `LinkManager` already ranks competing candidates. |
+| 2026-07-22 | Added Task 27 (ARC mesh relay route) | A production Rust relay already exists and is deployed; running both backends gives redundancy. Decided by the project owner. |
