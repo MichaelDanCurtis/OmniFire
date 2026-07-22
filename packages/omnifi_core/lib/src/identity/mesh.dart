@@ -124,23 +124,26 @@ class Mesh {
 
 Future<Mesh> loadOrCreateMesh({required SecureStore store}) async {
   final existingId = await store.read(_kMeshId);
+  final existingRoster = await store.read(_kRoster);
+
+  if ((existingId == null) != (existingRoster == null)) {
+    throw MeshError(
+      'mesh state is incomplete: ${existingId == null ? _kMeshId : _kRoster} '
+      'is missing while ${existingId == null ? _kRoster : _kMeshId} is '
+      'present. Continuing would overwrite the surviving half, silently '
+      'deauthorizing every previously-paired device. To recover, restore '
+      'the missing entry from a backup if possible; otherwise delete all '
+      'of the omnifi.mesh.* keys to deliberately start a new mesh.',
+    );
+  }
+
   if (existingId == null) {
     final mesh = Mesh(meshId: randomHexId());
     await saveMesh(mesh, store);
     return mesh;
   }
-  final roster = await store.read(_kRoster);
-  if (roster == null) {
-    throw const MeshError(
-      'stored mesh id is present but the roster (omnifi.mesh.roster) is '
-      'missing. Continuing with an empty roster is refused, since that '
-      'would silently deauthorize every previously-paired device. To '
-      'recover, restore the missing roster entry from a backup if '
-      'possible; otherwise delete all of the omnifi.mesh.* keys to '
-      'deliberately start a new mesh.',
-    );
-  }
-  final decoded = jsonDecode(roster);
+
+  final decoded = jsonDecode(existingRoster!);
   if (decoded is! Map) {
     throw ArgumentError('stored roster is malformed');
   }

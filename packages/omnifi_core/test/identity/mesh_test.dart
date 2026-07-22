@@ -148,4 +148,49 @@ void main() {
       throwsA(isA<ArgumentError>()),
     );
   });
+
+  test(
+      'throws MeshError when roster is stored but mesh id is missing '
+      '(partial state)', () async {
+    final store = InMemorySecureStore();
+    final mesh = await loadOrCreateMesh(store: store);
+    mesh.addPeer(peer('b' * 32, name: 'iPhone'));
+    await saveMesh(mesh, store);
+
+    // Simulate a partial write / storage eviction: the roster survives but
+    // the mesh id entry is gone.
+    await store.delete('omnifi.mesh.id');
+
+    expect(
+      () => loadOrCreateMesh(store: store),
+      throwsA(
+        isA<MeshError>().having(
+          (e) => e.reason,
+          'reason',
+          contains('incomplete'),
+        ),
+      ),
+    );
+  });
+
+  test(
+      'the roster survives the refusal when mesh id is missing '
+      '(no destructive overwrite)', () async {
+    final store = InMemorySecureStore();
+    final mesh = await loadOrCreateMesh(store: store);
+    mesh.addPeer(peer('b' * 32, name: 'iPhone'));
+    await saveMesh(mesh, store);
+
+    await store.delete('omnifi.mesh.id');
+
+    await expectLater(
+      () => loadOrCreateMesh(store: store),
+      throwsA(isA<MeshError>()),
+    );
+
+    final rosterAfter = await store.read('omnifi.mesh.roster');
+    expect(rosterAfter, isNotNull);
+    expect(rosterAfter, contains('iPhone'));
+    expect(rosterAfter, contains('b' * 32));
+  });
 }
