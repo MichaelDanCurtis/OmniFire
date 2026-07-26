@@ -100,9 +100,17 @@ class PairingFlow {
     // StreamIterator listens once and buffers while it is between reads.
     final inbox = StreamIterator<Uint8List>(link.inbound);
     try {
-      final ownMessage = await handshake.start();
-      // Started before the send so the peer's reply cannot outrun the listen.
+      // Armed before ANY suspension, not just before the send. A
+      // StreamIterator does not subscribe until moveNext() is called, and
+      // link.inbound is a broadcast stream, so a frame arriving while
+      // nothing is listening is discarded. `handshake.start()` suspends —
+      // it is safe today only because pure-Dart X25519 key generation
+      // resolves on the microtask queue; a platform-channel-backed provider
+      // such as cryptography_flutter suspends for real, the peer's first
+      // frame is dropped, and the exchange hangs to the timeout with no
+      // diagnostic.
       final peerMessageArrived = inbox.moveNext();
+      final ownMessage = await handshake.start();
       await link.send(ownMessage);
       if (!await peerMessageArrived) {
         throw const PairingRejectedError(
@@ -110,6 +118,21 @@ class PairingFlow {
             'its handshake message');
       }
       final peerMessage = inbox.current;
+
+      // Armed here, immediately after this read completes and before the SAS
+      // derivation and confirmationFor() below — which do real X25519/HKDF
+      // work and so can suspend for real, same as handshake.start() above —
+      // rather than after them. Unlike the first read, this one is not
+      // actually exposed to the drop described above: this StreamIterator's
+      // subscription already exists by now (it was created by the first
+      // moveNext()), and once a broadcast subscription exists, it buffers
+      // events delivered while paused and replays them on the next
+      // moveNext() instead of discarding them. Only the very first
+      // moveNext() — which brings the subscription into existence — has no
+      // such safety net. Armed here anyway, before rather than after, so
+      // this exchange has the same shape as the first and does not lean on
+      // that distinction being understood correctly.
+      final peerConfirmationArrived = inbox.moveNext();
 
       // The SAS is derived from the master *before* the peer's key
       // confirmation is verified, and deliberately so. A wrong PSK gives the
@@ -134,7 +157,6 @@ class PairingFlow {
       );
 
       final ownConfirmation = await handshake.confirmationFor(peerMessage);
-      final peerConfirmationArrived = inbox.moveNext();
       await link.send(ownConfirmation);
       if (!await peerConfirmationArrived) {
         throw const PairingRejectedError(
