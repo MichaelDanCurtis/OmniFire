@@ -272,6 +272,35 @@ void main() {
     expect(joinerOutcome.meshId, inviter.mesh.meshId);
   });
 
+  test('the rendezvous pairing entry points surface an unreachable relay',
+      () async {
+    // Wiring, not protocol: the two-device case is covered against the live
+    // relay in test/integration. What this pins down is that the engine's
+    // rendezvous entry points reach the rendezvous at all, and that a relay
+    // that is not there fails as a RendezvousError rather than as a raw
+    // socket error the UI has no idea what to do with -- or, worse, than
+    // hanging for the two-minute inviter timeout.
+    final e = await engine(
+      engineConfig: EngineConfig(
+        // Nothing listens here.
+        relayBases: [Uri(scheme: 'http', host: 'localhost', port: 1)],
+        displayName: 'Test Device',
+        lanEnabled: false,
+      ),
+    );
+    final invite = e.buildInvite();
+    const brief = Duration(milliseconds: 500);
+
+    await expectLater(
+      e.beginInviteAtRendezvous(invite, timeout: brief),
+      throwsA(isA<RendezvousError>()),
+    );
+    await expectLater(
+      e.beginJoinAtRendezvous(invite, timeout: brief),
+      throwsA(isA<RendezvousError>()),
+    );
+  });
+
   test('forgetting a peer removes it from the roster', () async {
     final e = await engine();
     e.mesh.addPeer(PeerRecord(

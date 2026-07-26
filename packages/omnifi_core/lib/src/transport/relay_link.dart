@@ -12,6 +12,12 @@ const List<int> broadcastAddress = [
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
+/// [broadcastAddress] written as a device id, for the one caller that has to
+/// name a destination before it knows one: a [RelayLink] constructed with this
+/// as its peer produces the all-zero header the relay fans out to every other
+/// socket in the mesh. See [PairingRendezvous].
+const String broadcastDeviceId = '00000000000000000000000000000000';
+
 Uri relayWebSocketUri({
   required Uri relayBase,
   required String meshId,
@@ -140,7 +146,9 @@ class RelayLink implements Link {
   final String id;
 
   final WebSocketChannel _channel;
-  final String _peerDeviceId;
+
+  /// Mutable for exactly one caller; see [retarget].
+  String _peerDeviceId;
 
   final StreamController<Uint8List> _inbound =
       StreamController<Uint8List>.broadcast();
@@ -176,6 +184,26 @@ class RelayLink implements Link {
   LinkQuality get quality => LinkQuality(kind: LinkKind.relay, rtt: _rtt);
 
   void recordRtt(Duration rtt) => _rtt = rtt;
+
+  /// Re-points this link's destination header at [peerDeviceId].
+  ///
+  /// Exists for exactly one caller: the pairing rendezvous. Both sides of a
+  /// pairing have to be *in* the rendezvous Durable Object before either can
+  /// learn the other's ephemeral device id — discovering it is the entire
+  /// point of the rendezvous — so the destination cannot be known at connect
+  /// time. Nothing else ever calls this: every other [RelayLink] is dialed
+  /// *for* a peer already in the roster and must never move.
+  ///
+  /// [id] deliberately does not change. [LinkManager] keys its candidate map
+  /// by it, and a link that renamed itself mid-flight would strand an entry
+  /// under the old key; the rendezvous link never reaches a LinkManager, and
+  /// keeping the id stable means this can never become the way one does.
+  void retarget(String peerDeviceId) {
+    // Validated here rather than at the next send, so a malformed id fails
+    // where the caller can attribute it.
+    _deviceIdBytes(peerDeviceId);
+    _peerDeviceId = peerDeviceId;
+  }
 
   void _setState(LinkState next) {
     if (_state == next) return;

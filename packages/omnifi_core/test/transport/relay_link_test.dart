@@ -524,4 +524,54 @@ void main() {
       expect(states, [LinkState.failed]);
     });
   });
+
+  group('retarget', () {
+    Future<({RelayLink link, FakeChannel channel})> broadcastLink() async {
+      final fake = FakeChannel();
+      final link = await RelayLink.connect(
+        relayBase: Uri.parse('http://localhost:8787'),
+        meshId: 'a' * 32,
+        localDeviceId: '1' * 32,
+        // How the pairing rendezvous opens a socket: no destination is known
+        // yet, so everything sent goes to the whole mesh.
+        peerDeviceId: broadcastDeviceId,
+        channelFactory: (_) => fake,
+      );
+      return (link: link, channel: fake);
+    }
+
+    test('moves the destination header onto the new peer', () async {
+      final f = await broadcastLink();
+      await f.link.send([9]);
+      expect((f.channel.sent.single as Uint8List).sublist(0, 16),
+          broadcastAddress,
+          reason: 'before retargeting, frames are broadcast to the mesh');
+
+      f.link.retarget('2' * 32);
+      f.channel.sent.clear();
+      await f.link.send([9]);
+      expect((f.channel.sent.single as Uint8List).sublist(0, 16),
+          List<int>.filled(16, 0x22),
+          reason: 'after retargeting, the relay routes to that device alone');
+    });
+
+    test('leaves the link id alone', () async {
+      final f = await broadcastLink();
+      final before = f.link.id;
+      f.link.retarget('2' * 32);
+      // LinkManager keys its candidate map by id; a link that renamed itself
+      // mid-flight would strand the entry under the old key.
+      expect(f.link.id, before);
+    });
+
+    test('rejects a malformed device id without moving the destination',
+        () async {
+      final f = await broadcastLink();
+      expect(() => f.link.retarget('not-hex'), throwsArgumentError);
+      await f.link.send([9]);
+      expect((f.channel.sent.single as Uint8List).sublist(0, 16),
+          broadcastAddress,
+          reason: 'a rejected retarget must not half-apply');
+    });
+  });
 }

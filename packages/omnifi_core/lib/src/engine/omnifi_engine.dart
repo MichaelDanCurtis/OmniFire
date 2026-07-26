@@ -6,6 +6,7 @@ import '../identity/mesh.dart';
 import '../identity/secure_store.dart';
 import '../pairing/pairing_flow.dart';
 import '../pairing/pairing_payload.dart';
+import '../pairing/rendezvous.dart';
 import '../protocol/envelope.dart';
 import '../session/peer_session.dart';
 import '../session/session_establisher.dart';
@@ -554,6 +555,69 @@ class OmniFiEngine {
     Link link,
   ) =>
       PairingFlow.join(identity: identity, invite: invite, link: link);
+
+  /// Opens a pairing rendezvous, waits there for a joiner, and runs the
+  /// inviting side over the link it produces.
+  ///
+  /// What the UI calls while it is showing the QR for [invite]. It exists
+  /// because nothing else creates a link to a device that is not yet in the
+  /// roster: [LinkManager]'s dialers and the LAN listener both need a
+  /// [PeerRecord], which is what pairing produces.
+  ///
+  /// The link is closed if the pairing flow fails to start; on success the
+  /// caller owns it and closes it once [PairingSasPending.confirm] has
+  /// resolved either way. It is a rendezvous link, not a mesh link: it is
+  /// disposable, and the peer is reached on its real mesh from then on.
+  Future<PairingSasPending> beginInviteAtRendezvous(
+    PairingInvite invite, {
+    Uri? relayBase,
+    Duration timeout = const Duration(minutes: 2),
+  }) =>
+      _overRendezvous(
+        () => PairingRendezvous.awaitJoiner(
+          invite: invite,
+          relayBase: relayBase ?? config.primaryRelay,
+          timeout: timeout,
+        ),
+        (link) => beginInvite(invite, link),
+      );
+
+  /// Announces this device at the rendezvous named by a scanned [invite] and
+  /// runs the joining side over the link it produces.
+  ///
+  /// [relayBase] defaults to this device's own configured relay, **not** to
+  /// [PairingInvite.relayHint]. The hint arrives inside an unauthenticated QR
+  /// payload, so following it automatically would let whoever produced that
+  /// code choose which server this device opens a socket to. A caller that has
+  /// decided to trust a hint can still pass it here explicitly.
+  Future<PairingSasPending> beginJoinAtRendezvous(
+    PairingInvite invite, {
+    Uri? relayBase,
+    Duration timeout = const Duration(seconds: 30),
+  }) =>
+      _overRendezvous(
+        () => PairingRendezvous.connectToInviter(
+          invite: invite,
+          relayBase: relayBase ?? config.primaryRelay,
+          timeout: timeout,
+        ),
+        (link) => beginJoin(invite, link),
+      );
+
+  Future<PairingSasPending> _overRendezvous(
+    Future<Link> Function() meet,
+    Future<PairingSasPending> Function(Link link) run,
+  ) async {
+    final link = await meet();
+    try {
+      return await run(link);
+    } on Object {
+      // The rendezvous link exists only to carry this exchange. A pairing that
+      // never got as far as the SAS has no caller left to close it.
+      await _closeQuietly(link);
+      rethrow;
+    }
+  }
 
   Future<void> forgetPeer(String deviceId) async {
     mesh.removePeer(deviceId);
