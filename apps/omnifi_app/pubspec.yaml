@@ -33,7 +33,12 @@ dependencies:
   omnifi_core:
     path: ../../packages/omnifi_core
   qr_flutter: ^4.1.0
-  mobile_scanner: ^5.2.3
+  # mobile_scanner was removed (unused; pulled in MLKit, which only ships
+  # x86_64 iOS simulator slices, forcing arm64 Macs into a Rosetta build).
+  # When QR scanning is wired up, use an AVFoundation-based scanner
+  # (AVCaptureMetadataOutput) instead — it ships arm64 simulator slices and
+  # needs no third-party binary framework. Note the simulator has no
+  # camera regardless, so scanning will need a physical device to verify.
 
 dev_dependencies:
   flutter_test:
