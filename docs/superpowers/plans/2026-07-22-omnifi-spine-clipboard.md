@@ -7691,6 +7691,30 @@ class PowerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 }
 ```
 
+- [ ] **Step 7b: Add the Swift files to the Xcode target — do not skip this**
+
+Creating a `.swift` file under `macos/Runner/` does **not** compile it. Xcode only
+builds files listed in the target's `PBXSourcesBuildPhase`, and Flutter's
+`flutter create` template does not glob the directory. Omit this and you get an app
+that builds cleanly, launches, and silently has no plugins at all — every method
+channel call fails at runtime with `MissingPluginException`, which reads like a Dart
+bug rather than a build one.
+
+Add each new `.swift` file to the `Runner` target in `macos/Runner.xcodeproj/project.pbxproj`
+(three entries per file: `PBXBuildFile`, `PBXFileReference`, and the `PBXSourcesBuildPhase`
+member list), or open the project in Xcode and add them to the target there.
+
+**Verify rather than assume.** After building, confirm the channel names are actually
+in the shipped binary:
+
+```bash
+strings build/macos/Build/Products/Debug/omnifi_app.app/Contents/MacOS/omnifi_app | grep 'com.omnifi/'
+```
+
+Expected: one line per channel. An empty result means the Swift never compiled in.
+
+The same applies verbatim to the iOS target in Task 25.
+
 - [ ] **Step 8: Register the plugins**
 
 Modify `apps/omnifi_app/macos/Runner/AppDelegate.swift` — add inside `applicationDidFinishLaunching`, or add the override if it is absent:
