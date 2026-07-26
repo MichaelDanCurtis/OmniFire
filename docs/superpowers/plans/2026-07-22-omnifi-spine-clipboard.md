@@ -9125,3 +9125,84 @@ Both sides compute the same answer from data they already hold, so there is no n
 ### Note on scope
 
 This does not add key rotation, session resumption, or 0-RTT. A reconnect costs one full handshake — three X25519 operations and a round trip — which is negligible against the reconnect itself.
+
+---
+
+## Task 29: Pairing rendezvous
+
+Found when the Flutter shell was built: `PairingFlow.invite` and `.join` both take a `Link`, and **nothing creates it**. Two devices that are pairing are not yet in each other's rosters, so neither the `LinkManager` dial path nor the LAN listener applies. Until this exists, pairing cannot complete end to end and nothing downstream of pairing can be tested on real hardware.
+
+**Files:**
+- Create: `packages/omnifi_core/lib/src/pairing/rendezvous.dart`
+- Modify: `packages/omnifi_core/lib/src/engine/omnifi_engine.dart`
+- Modify: `packages/omnifi_core/lib/omnifi_core.dart`
+- Test: `packages/omnifi_core/test/pairing/rendezvous_test.dart`
+- Test: extend `packages/omnifi_core/test/integration/relay_roundtrip_test.dart`
+
+### Design — meet in a derived namespace
+
+The relay treats a mesh ID as an opaque 32-hex routing key and creates a Durable Object per distinct value on demand. Nothing requires that value to be a *real* mesh. So the two pairing devices meet in a **rendezvous namespace derived from the pre-shared key already in the QR**:
+
+```
+rendezvousId = HKDF-SHA256(ikm: invite.psk, info: "omnifi-rendezvous-v1", len: 16) → 32 lowercase hex
+```
+
+Both sides connect to `/v1/mesh/<rendezvousId>/ws?device=<ephemeralId>` with a **fresh random ephemeral device ID** — not their real one.
+
+Why this shape:
+
+- **No relay change at all.** The rendezvous ID is a valid mesh ID as far as the relay is concerned.
+- **No collision with live mesh traffic.** The inviter may already hold a socket to its real mesh's DO; this is a separate DO, so nothing is demultiplexed and no device ID is duplicated on one socket set.
+- **Unguessable without the QR.** The namespace is derived from the PSK, so finding it requires the invite. That is not new exposure — the PSK is already the pairing secret, and the SAS is what defends against someone who *has* observed the QR.
+- **Costs nothing when idle.** The DO hibernates and is discarded once both sides disconnect.
+
+**Ephemeral device IDs matter.** Using real device IDs here would publish them to anyone who has seen the QR, before any authentication has happened. The ephemeral ID is used only to address relay frames during the exchange; the real identity is established by the handshake inside `PairingFlow`.
+
+### Flow
+
+1. Both sides derive `rendezvousId` from `invite.psk` and connect with their own fresh `ephemeralId`.
+2. The **joiner** broadcasts a `rendezvousHello` (16 zero bytes destination) carrying its `ephemeralId`.
+3. The **inviter**, waiting in invite mode, receives it and learns the joiner's `ephemeralId`.
+4. Each side constructs a `RelayLink` targeted at the other's `ephemeralId`.
+5. `PairingFlow.invite` / `.join` run over those links exactly as they do today — unchanged.
+6. On success or failure both rendezvous links close.
+
+**Interfaces:**
+- `String rendezvousIdFor(List<int> psk)` — deterministic, both sides derive the same value.
+- `class RendezvousError implements Exception`
+- `class PairingRendezvous` with:
+  - `static Future<Link> awaitJoiner({required PairingInvite invite, required Uri relayBase, Duration timeout = const Duration(minutes: 2)})` — inviter side.
+  - `static Future<Link> connectToInviter({required PairingInvite invite, required Uri relayBase, Duration timeout = const Duration(seconds: 30)})` — joiner side.
+- Engine: `beginInvite`/`beginJoin` gain rendezvous-creating variants so the UI does not have to build links itself.
+
+### Hazards this codebase has already been bitten by
+
+- **Arm the inbox before the first suspension.** `RelayLink.inbound` is a broadcast stream; a frame arriving with no listener attached is dropped and the symptom is an intermittent hang, not a clean failure. `SessionEstablisher` had exactly this bug latent. Subscribe *before* sending anything.
+- **The inviter's timeout is long (a user is walking to another device); the joiner's is short.** Do not use one value for both.
+- **A `RelayLink` whose peer never appears must fail, not hang.** Both timeouts must close the underlying socket.
+- **Two joiners could hit one rendezvous.** The inviter accepts the first `rendezvousHello` and ignores the rest; a second joiner fails its timeout rather than silently pairing to nothing. The SAS still protects the accepted one.
+
+### Tests
+
+1. `rendezvousIdFor` is deterministic, 32 lowercase hex, and differs for different PSKs.
+2. Two `PairingRendezvous` sides with the same invite find each other over a **live local relay** and produce links that carry frames both ways.
+3. A full pairing completes over the rendezvous: both sides derive the **same SAS**, both confirm, both end with a roster entry for the other.
+4. A joiner with the wrong PSK derives a different rendezvous ID and times out rather than pairing.
+5. The inviter times out and closes its socket when no joiner appears.
+6. A second joiner arriving after the first is ignored and times out; the first pairing still completes.
+
+Tests 2–6 need a live `wrangler dev`; tag them `integration` so a plain `dart test` skips them, and state plainly in the report if the relay could not be started.
+
+---
+
+## Amendment log — 2026-07-24
+
+| Change | Reason |
+|---|---|
+| **The iPhone is the authority, not macOS.** Relay / authority / capability-provider are now three distinct roles. | The always-on device is the phone, not a laptop that is frequently closed. See the spec amendment of the same date. |
+| **iOS reframed from "second-class peer" to "the authority, request-driven."** Task 25's framing changes; its `LifecycleBridge` work does not. | iOS cannot hold a background socket without a Network Extension. But privileged operations are human-in-the-loop by nature — Face ID requires the user to be holding the phone — so the phone never needs to act unattended. |
+| **macOS becomes an optional capability provider.** | It is the only device that can read `chat.db`. That makes it necessary *for iMessage*, not load-bearing for the product. |
+| **The relay gains an APNs key and a mesh→token map** (a later task). | Waking a backgrounded phone requires it. Content stays encrypted; the relay gains the ability to *wake* a device, never to *read* one. Recorded as a deliberate erosion of the dumb-relay principle. |
+| **Added Task 29 (pairing rendezvous).** | `PairingFlow` takes a `Link` that nothing created. Pairing could not complete end to end. |
+| **Capability responses are targeted, never broadcast.** | A live 2FA code fanned out to every device would let a compromised machine harvest codes it never requested. |
+| **Authenticator deferred to its own project.** | Needs Secure Enclave work, the APNs path, and a capability layer — none testable until a mesh can pair. |
