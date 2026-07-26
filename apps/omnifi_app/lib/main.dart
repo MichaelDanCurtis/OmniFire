@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:omnifi_core/omnifi_core.dart';
@@ -6,6 +7,7 @@ import 'package:omnifi_core/omnifi_core.dart';
 import 'app.dart';
 import 'engine_provider.dart';
 import 'platform/clipboard_watcher_impl.dart';
+import 'platform/lifecycle.dart';
 import 'platform/power_events.dart';
 import 'platform/secure_store_impl.dart';
 
@@ -77,23 +79,66 @@ Future<void> main() async {
   // case that leaves the engine holding a suspended socket that still looks
   // connected. Kept for the whole process lifetime, so no subscription handle
   // is retained.
-  PowerEvents().events.listen((event) {
-    switch (event) {
-      case 'wake':
-        // Forces every LinkManager to redial now rather than wait out a
-        // backoff that started before the machine went to sleep.
-        unawaited(engine.onWake());
-      case 'lock':
-        engine.onScreenLocked();
-      case 'unlock':
-        engine.onScreenUnlocked();
-      case 'sleep':
-        // Nothing to do: the engine has no teardown-on-sleep, and the links
-        // are already suspended by the OS by the time this arrives. It is
-        // 'wake' that does the work.
-        break;
-    }
-  });
+  //
+  // Guarded by platform, because `com.omnifi/power` only has a plugin behind
+  // it on macOS. Subscribing on iOS would not throw — `EventChannel` reports a
+  // failed `listen` through `FlutterError.reportError` rather than into the
+  // stream — but it would log an error on every single launch, and a log line
+  // that is always there is a log line nobody reads. iOS has no equivalent
+  // signal to offer a foreground-only app anyway: sleep and wake are the
+  // lifecycle transitions below, and there is no lock notification.
+  if (Platform.isMacOS) {
+    PowerEvents().events.listen((event) {
+      switch (event) {
+        case 'wake':
+          // Forces every LinkManager to redial now rather than wait out a
+          // backoff that started before the machine went to sleep.
+          unawaited(engine.onWake());
+        case 'lock':
+          engine.onScreenLocked();
+        case 'unlock':
+          engine.onScreenUnlocked();
+        case 'sleep':
+          // Nothing to do: the engine has no teardown-on-sleep, and the links
+          // are already suspended by the OS by the time this arrives. It is
+          // 'wake' that does the work.
+          break;
+      }
+    });
+  }
+
+  // The engine's lifetime, tied to the app being in front of the user.
+  //
+  // This is what makes the phone a device that answers only while its owner
+  // is present, rather than a service that happens to be unreachable most of
+  // the time: on `paused` the engine tears its links down itself, while there
+  // is still a run loop to do it in, instead of leaving iOS to sever a socket
+  // the peer then has to discover by timeout. On macOS `paused` never arrives
+  // and `inactive`/`hidden` are inert, so a desktop agent runs uninterrupted.
+  //
+  // Held for the process lifetime; there is no symmetric `removeObserver`
+  // because there is no point at which this should stop being true.
+  final lifecycle = LifecycleBridge(
+    onResume: engine.start,
+    onPause: engine.stop,
+  );
+  WidgetsBinding.instance.addObserver(lifecycle);
+  try {
+    // Awaited, and inside the same failure posture as `bootstrapEngine`.
+    // `engine.start()` does not block on any network dial — `LinkManager`
+    // fires those unawaited — so the only things being waited on here are
+    // `clipboard.start()` and the LAN listener's bind. The first of those is
+    // a platform-channel call, which means an unregistered plugin surfaces
+    // right here as `MissingPluginException` on a visible failure screen,
+    // rather than as an app that launches, looks entirely healthy, and syncs
+    // nothing. `EngineHost.initState` calls `start()` again a moment later;
+    // that one returns immediately, because the engine's own `_started` flag
+    // makes it idempotent.
+    await lifecycle.handle(AppLifecycleState.resumed);
+  } catch (error) {
+    runApp(_StartupFailureApp(error: error));
+    return;
+  }
 
   runApp(EngineHost(
     engine: engine,
