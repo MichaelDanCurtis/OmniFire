@@ -9266,3 +9266,60 @@ Tests 2–6 need a live `wrangler dev`; tag them `integration` so a plain `dart 
 | **Added Task 29 (pairing rendezvous).** | `PairingFlow` takes a `Link` that nothing created. Pairing could not complete end to end. |
 | **Capability responses are targeted, never broadcast.** | A live 2FA code fanned out to every device would let a compromised machine harvest codes it never requested. |
 | **Authenticator deferred to its own project.** | Needs Secure Enclave work, the APNs path, and a capability layer — none testable until a mesh can pair. |
+
+---
+
+## Task 30: macOS menu-bar agent
+
+Found at review: the spec says "macOS ships as a menu-bar agent, Windows as a tray app", and Tasks 23 and 24 both carry it in their **titles** — but no step in either implements one, so both desktop apps are ordinary windowed apps. Verified by grep: no `NSStatusItem`, no `LSUIElement`, no `Shell_NotifyIcon` anywhere. The implementers built exactly what their steps specified; the titles promised what the steps never delivered.
+
+**Scope: macOS only.** That is the platform that can be built and run here, so it can be verified rather than assumed. The Windows tray is deferred with the rest of the unverifiable Windows surface.
+
+**Files:**
+- Create: `apps/omnifi_app/macos/Runner/StatusItemPlugin.swift`
+- Create: `apps/omnifi_app/lib/platform/status_item.dart`
+- Modify: `apps/omnifi_app/macos/Runner/AppDelegate.swift`
+- Modify: `apps/omnifi_app/macos/Runner/Info.plist`
+- Modify: `apps/omnifi_app/macos/Runner.xcodeproj/project.pbxproj`
+- Modify: `apps/omnifi_app/lib/main.dart`
+- Test: `apps/omnifi_app/test/platform/status_item_test.dart`
+
+### Why this matters more than it sounds
+
+A clipboard sync tool is a background utility. As a windowed app it keeps a dock icon, appears in the app switcher, and is quit by accident by anyone tidying up — at which point sync silently stops with no indication. The menu bar is where a user checks *"is it even connected"*, which the engine already answers precisely: `status` is the **worst** peer's state, not the best, so a green icon means every device is reachable.
+
+### Design
+
+**Native `NSStatusItem` plus `NSMenu`, driven from Dart over a method channel.** Not a Flutter popover window: the menu is a status line, a pause toggle, and two commands, all of which AppKit renders better and faster than an embedded Flutter surface. The existing Flutter UI stays as a normal window opened on demand from the menu.
+
+- `LSUIElement = true` in `Info.plist` removes the dock icon and the app-switcher entry.
+- Flutter's macOS embedder shows `mainFlutterWindow` at launch. With `LSUIElement` that window must be ordered out at startup and shown only when the user asks, via `NSApp.activate(ignoringOtherApps: true)` followed by `makeKeyAndOrderFront`.
+
+**Interfaces:**
+- Channel `com.omnifi/status_item`, methods:
+  - `setStatus({status: String})` — one of `connectedDirect`, `connectedRelay`, `reconnecting`, `offline`
+  - `setPaused({paused: bool})` — reflects the check state
+  - `show()` / `hide()` — the main window
+- Event channel `com.omnifi/status_item/commands` emitting `openWindow`, `togglePause`, `quit`.
+- `class StatusItemBridge` in Dart: subscribes to `engine.statuses`, pushes state down, and routes commands back to `engine.clipboard.setPaused` and window control.
+
+**The four states must be visually distinct, not just textually.** Use SF Symbols with distinct shapes rather than colour alone — colour alone fails for a colour-blind user and is invisible in a monochrome menu bar. Suggested: `bolt.fill` (direct), `cloud.fill` (relay), `arrow.triangle.2.circlepath` (reconnecting), `bolt.slash` (offline). Set `image.isTemplate = true` so the icon follows the menu bar's light/dark appearance.
+
+### Hazards
+
+- **`quit` must stop the engine before terminating**, or the last peer sees a socket that looks alive until its liveness timeout. Call `engine.stop()` and await it before `NSApp.terminate`.
+- **The status item must be created on the main thread** and retained — an `NSStatusItem` that is not held by a strong reference disappears from the menu bar with no error.
+- **`LSUIElement` changes activation policy**, so a window shown without `NSApp.activate` appears behind other apps and looks like nothing happened.
+- **The pause toggle is two-way.** The engine can pause itself on screen lock, so the menu's check state must follow `ClipboardSync.isPaused` rather than only the user's clicks.
+- **`.swift` files must be added to the Xcode target** or they are silently never compiled — see Task 23's Step 7b. Verify with `strings` against `Runner.debug.dylib`, not `Runner`.
+
+### Tests
+
+Dart side, in `test/platform/status_item_test.dart`:
+1. Each of the four `ConnectionStatus` values maps to its own distinct wire string — a mapping that collapses two states fails.
+2. A status change on `engine.statuses` pushes exactly one `setStatus` with the right value.
+3. A `togglePause` command calls `setPaused` on the clipboard and pushes the new state back down.
+4. A `quit` command stops the engine before requesting termination.
+5. The bridge tolerates a `MissingPluginException` on a non-macOS platform without throwing — the same shape as `PowerEvents`' `Platform.isMacOS` guard.
+
+Swift side is verified by running: launch, confirm no dock icon, confirm the item appears, confirm the icon changes with status, confirm pause round-trips, confirm quit exits cleanly.
