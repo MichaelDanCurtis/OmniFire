@@ -7,8 +7,10 @@ project(runner LANGUAGES CXX)
 #
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
+  "clipboard_plugin.cpp"
   "flutter_window.cpp"
   "main.cpp"
+  "secure_store_plugin.cpp"
   "utils.cpp"
   "win32_window.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
@@ -34,6 +36,12 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
+# CredReadW / CredWriteW / CredDeleteW / CredFree are exported by advapi32 on
+# current Windows SDKs -- NOT by credui, which only carries the credential
+# *dialog* functions this app does not use. The clipboard and format-listener
+# calls come from user32. Both are in CMake's default MSVC library list today;
+# naming them keeps that from being a silent dependency.
+target_link_libraries(${BINARY_NAME} PRIVATE "advapi32.lib" "user32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

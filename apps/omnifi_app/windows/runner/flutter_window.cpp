@@ -2,7 +2,9 @@
 
 #include <optional>
 
+#include "clipboard_plugin.h"
 #include "flutter/generated_plugin_registrant.h"
+#include "secure_store_plugin.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -25,6 +27,18 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+
+  // OmniFi's own plugins live in the runner rather than in a pub package, so
+  // they are not in `generated_plugin_registrant.h` and have to be registered
+  // by hand. The clipboard plugin needs this window: WM_CLIPBOARDUPDATE is
+  // delivered to a window, and the clipboard is owned by a window while we
+  // write to it. `GetHandle()` is already valid here -- `Win32Window::Create`
+  // sets the handle while `CreateWindow` is still running and only then calls
+  // `OnCreate`.
+  RegisterSecureStorePlugin(flutter_controller_->engine()->messenger());
+  RegisterClipboardPlugin(flutter_controller_->engine()->messenger(),
+                          GetHandle());
+
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -40,6 +54,11 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  // Before the engine goes: this drops the clipboard format listener and the
+  // event sink, so a WM_CLIPBOARDUPDATE arriving mid-teardown cannot push an
+  // event into a messenger that is being destroyed.
+  UnregisterClipboardPlugin();
+
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -62,6 +81,12 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    // Posted because `start` called AddClipboardFormatListener on this window.
+    // Registering that listener without handling the message here is a silent
+    // no-op: the plugin would look correct and never emit an event.
+    case WM_CLIPBOARDUPDATE:
+      OnClipboardUpdate();
+      return 0;
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;
