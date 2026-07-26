@@ -268,3 +268,75 @@ Three classes, handled differently:
 | iOS background sync via silent push | Future |
 | Revocation ledger for offline devices | Not planned at this mesh size |
 | Accounts, billing, App Store distribution | Not planned (audience is self + handful) |
+
+---
+
+# Amendment — 2026-07-24: the iPhone is the authority, not the Mac
+
+Supersedes §1's "the Mac app will be a **required server**" and §4's "iOS is a second-class peer".
+
+## The change
+
+The original spec made macOS the hub because iMessage requires reading a local `chat.db`. That reasoning was sound for iMessage and wrong for the product: it made the always-on device a laptop that is frequently closed, when the device actually always present is the phone.
+
+**Two roles were conflated and are now separated:**
+
+| Role | Device | Definition |
+|---|---|---|
+| **Relay** | Cloudflare Worker / ARC | A dumb byte forwarder. Cannot decrypt anything. Unchanged. |
+| **Authority** | **iPhone** | Holds secrets and answers privileged requests. Secure Enclave, Face ID, Neural Engine. |
+| **Capability provider** | macOS (optional) | The only device that can read `chat.db`. Have one → iMessage works. Don't → it doesn't. |
+
+The iPhone becomes the **trust root**, not the router. No device is a hub in the routing sense.
+
+## Why the iPhone cannot be a relay
+
+Routing other devices' traffic through the phone would require it to hold a live socket while backgrounded. iOS suspends the app within seconds. The escape hatches were evaluated and rejected:
+
+- **PushKit / VoIP push** — the OS terminates the app unless it reports a CallKit call inside the handler. Also grounds for App Store rejection. Not viable.
+- **`NEAppPushProvider`** (Local Push Connectivity) — genuinely persistent, but only on a nominated Wi-Fi SSID, so it does nothing on cellular. Defeats the premise, and the entitlement targets MDM-deployed enterprise apps.
+- **`NEPacketTunnelProvider`** — an always-on VPN. Works everywhere; this is how Tailscale persists on iOS. Rejected as scope: it makes the product a VPN, adds a permanent VPN indicator, and needs a Network Extension entitlement.
+
+## Why the request-driven model is sufficient
+
+The privileged operations this design cares about are **human-in-the-loop by nature**. Generating a 2FA code requires the user to authenticate with Face ID, which requires them to be holding the phone. So the phone never needs to act unattended:
+
+```
+desktop requests  →  APNs wakes the phone  →  user taps the notification
+                  →  app foregrounds  →  Face ID  →  phone answers
+                  →  response travels the existing encrypted session
+```
+
+The notification is not a workaround for an iOS restriction — it is the interaction.
+
+**Consequence:** iOS's foreground-only constraint stops being a limitation to apologise for and becomes the security model. The phone answers only when its owner is present and has authenticated.
+
+## Threat model change — the relay is no longer fully blind
+
+Waking a backgrounded phone requires an APNs auth key, which cannot be distributed to every desktop. The relay (or an adjacent worker) therefore holds:
+
+- the APNs auth key, and
+- a mesh ID → device token mapping.
+
+| Relay can see | Relay still cannot see |
+|---|---|
+| Mesh IDs | Any message content |
+| Device tokens (can wake your phone) | Device identities / public keys |
+| Connection timing, frame sizes | Which capability is being invoked |
+| | Clipboard data, TOTP seeds, or generated codes |
+
+This is a deliberate, recorded erosion of §3's "the relay is dumb" principle. It is bounded: the relay gains the ability to *wake* a device, never to *read* one.
+
+## Impact on the built code
+
+**None.** Verified 2026-07-24: the core encodes no hub, host, or role concept. `PeerRecord` is `{deviceId, publicKey, displayName, addedAtMs}`; sessions are pair-keyed; `LinkManager` ranks links rather than devices. The mesh was already symmetric, so the pivot costs nothing against the 278 passing tests.
+
+## What this adds
+
+1. **A capability layer** — request/response on top of the existing envelope. Additive: two new `MessageType` wire names.
+2. **An APNs wake path** — relay-side key and token registry, iOS-side push handling.
+3. **Targeted delivery** — a capability response goes to the **requesting device only**, never broadcast. This is a deliberate departure from clipboard sync's fan-out: a live 2FA code reaching every machine would let a compromised device harvest codes it never asked for.
+
+## Deferred to its own project
+
+**The authenticator** (TOTP seeds in the Keychain under `kSecAccessControlBiometryCurrentSet`, Face-ID-gated generation, targeted delivery) gets its own spec → plan → build cycle after Project 1. It depends on Secure Enclave work, the APNs path, and the capability layer, none of which can be exercised until a mesh can actually pair.
