@@ -8698,7 +8698,24 @@ Two consistency fixes applied inline while reviewing:
 
 ---
 
-## Task 27: ARC mesh relay route (second relay backend)
+## Task 27: ARC mesh relay route (second relay backend) — DEFERRED
+
+> **Status: deferred to a later project (decided 2026-07-24).** Not built in Project 1.
+>
+> The Cloudflare relay is built, reviewed, and proven end to end — two devices with
+> independent identities genuinely paired through a live `wrangler dev`, deriving
+> matching short authentication strings. ARC would add redundancy, not capability,
+> at the cost of a second service to operate and a wire contract to keep identical
+> across two implementations.
+>
+> **Nothing needs rework to add it later.** `EngineConfig.relayBases` is already a
+> `List<Uri>` with one dialer built per entry, `RelayLink.id` already includes host
+> *and* port so two backends cannot collide in `LinkManager`'s candidate map, and
+> the client treats relays as competing candidates rather than a primary plus a
+> failover. Adding ARC is one list entry plus the Rust route below.
+>
+> The task specification below is retained verbatim so it can be picked up as-is.
+
 
 Added after the plan's first draft, when it emerged that a production Rust relay (`arc-relay`) already exists and is deployed. The decision was to run **both** backends: Cloudflare as the default, ARC as an equal-standing second candidate. `LinkManager` already races dialers and ranks by preference score, so this needs no new client failover logic — only a second entry in `EngineConfig.relayBases`.
 
