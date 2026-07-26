@@ -8454,6 +8454,25 @@ class ClipboardPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 }
 ```
 
+> **Two corrections found by running this on a simulator (2026-07-24):**
+>
+> 1. **`window?.rootViewController as! FlutterViewController` crashes on launch.**
+>    This target is scene-based, so `window` is nil at the point `didFinishLaunching`
+>    runs and the force-unwrap traps immediately. Register in
+>    `didInitializeImplicitFlutterEngine` instead.
+> 2. **`registrar.messenger` is a *method* on iOS** (`registrar.messenger()`) and a
+>    *property* on macOS. Getting this wrong means nothing registers.
+>
+> **And the same Xcode-target trap as macOS applies here** — see Task 23's Step 7b.
+> A `.swift` file under `ios/Runner/` is not compiled unless it is a member of the
+> target's `PBXSourcesBuildPhase`; Flutter's template does not glob the directory.
+> Omit it and the app builds, launches, and silently has no plugins, failing every
+> channel call at runtime with `MissingPluginException`.
+>
+> Verify with `strings` against **`Runner.debug.dylib`**, not `Runner` — under
+> Xcode 16 debug code lives in the dylib, so grepping `Runner` returns nothing and
+> looks like the plugin never compiled in.
+
 - [ ] **Step 7: Register the iOS plugins**
 
 Modify `apps/omnifi_app/ios/Runner/AppDelegate.swift` — inside `application(_:didFinishLaunchingWithOptions:)`, before `return super.application(...)`:
