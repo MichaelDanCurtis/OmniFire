@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Off, deliberately, and this is the decision that rules out the Mac
+	     App Store. Two things need it off: the LAN listener OmniFiEngine
+	     binds, and the Full Disk Access that project 2's ~/Library/Messages/
+	     chat.db reader will need — a sandboxed app cannot be granted FDA at
+	     all. Distribution is direct and notarized instead. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- Flutter's debug build runs Dart in the JIT. Harmless while the
+	     hardened runtime is off (it is), and required the moment it is on. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<!-- Both are sandbox entitlements, so with the sandbox off they grant
+	     nothing today. Kept because they record what this app needs, and
+	     because re-enabling the sandbox without them is the exact failure
+	     that already happened once here: an app that builds, launches, looks
+	     healthy and connects to nothing.
+	     Inbound: the LAN listener a peer on the same network connects to. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- Outbound: every relay in EngineConfig.relayBases, dialed as a
+	     WebSocket, plus direct dials to LAN peers. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

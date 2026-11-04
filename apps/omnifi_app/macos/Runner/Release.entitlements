@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Off, deliberately. See DebugProfile.entitlements: the LAN listener and
+	     project 2's Full Disk Access to chat.db both require it, and the
+	     consequence — no Mac App Store, direct notarized distribution only —
+	     is accepted in the spec. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- Sandbox entitlements, inert while the sandbox is off. Kept so that
+	     re-enabling it does not silently produce a release build with no
+	     network access at all, which is what Flutter's own Release template
+	     grants and what this file used to inherit. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

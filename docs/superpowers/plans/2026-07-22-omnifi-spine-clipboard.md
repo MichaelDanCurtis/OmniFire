@@ -26,6 +26,7 @@
 - The relay MUST NOT be able to decrypt any payload. It routes by mesh ID and device ID only.
 - Every commit message uses Conventional Commits (`feat:`, `test:`, `fix:`, `chore:`, `docs:`).
 - Run `dart analyze` before every commit in Dart packages; it must report zero issues.
+- **Two relay backends exist and must stay contract-identical:** the Cloudflare Worker (Task 18) and an ARC route (Task 27). Any change to the relay wire contract must land in both, and the Task 19 integration suite must be run against both before either is considered done. The client treats them as competing candidate links, not as a primary and a failover — see Task 21's `EngineConfig.relayBases`.
 
 ---
 
@@ -551,16 +552,26 @@ Implements **OmniFi Session Handshake v1**, the construction selected as option 
 
 Both parties hold a static X25519 keypair. The initiator knows the responder's static public key; after pairing, the responder knows the initiator's too. During *pairing* the parties do not yet know each other's static keys, so a pre-shared key from the QR payload is mixed in instead — that variant is `psk`.
 
-1. Initiator generates ephemeral `ei`, sends `HS1 = CBOR{v, deviceId, ePub}`.
-2. Responder generates ephemeral `er`, sends `HS2 = CBOR{v, deviceId, ePub}`.
-3. Both compute three Diffie-Hellman results:
+1. Initiator generates ephemeral `ei`, sends `HS1 = CBOR{v, deviceId, ePub, sPub}`.
+2. Responder generates ephemeral `er`, sends `HS2 = CBOR{v, deviceId, ePub, sPub}`.
+3. Each side **learns the peer's static public key from the peer's message** and computes three Diffie-Hellman results against it:
    - `dh_ee = DH(e_self, e_peer)` — provides forward secrecy
    - `dh_es = DH(e_initiator, s_responder)` — authenticates the responder
    - `dh_se = DH(s_initiator, e_responder)` — authenticates the initiator
 4. `transcript = HS1_bytes || HS2_bytes` (initiator's message always first).
 5. `master = HKDF-SHA256(ikm: dh_ee || dh_es || dh_se, salt: transcript || psk, info: "omnifi-session-v1", length: 32)`
-6. `k_i2r = HKDF-Expand(master, info: "i2r", 32)`, `k_r2i = HKDF-Expand(master, info: "r2i", 32)`
-7. Each side seals the literal bytes `omnifi-confirm` with counter 0 and `aad = transcript`, and sends it. Failure to open the peer's confirmation aborts the handshake.
+6. Four keys are expanded from `master`, **two for data and two for confirmation**:
+   - `k_i2r = HKDF-Expand(master, info: "i2r", 32)`, `k_r2i = HKDF-Expand(master, info: "r2i", 32)` — the returned session
+   - `k_i2r_confirm = HKDF-Expand(master, info: "i2r-confirm", 32)`, `k_r2i_confirm = HKDF-Expand(master, info: "r2i-confirm", 32)` — used *only* for step 7
+7. Each side seals the literal bytes `omnifi-confirm` under its **confirmation** key with counter 0 and `aad = transcript`, and sends it. Failure to open the peer's confirmation aborts the handshake.
+
+**Why confirmation gets its own keys — this is not optional.** An earlier draft sealed the confirmation under `k_i2r`/`k_r2i` at counter 0 and then returned a fresh `AeadSession` on the same keys, whose send counter also starts at 0. That is (key, nonce) reuse. Because the confirmation plaintext is the public constant `omnifi-confirm`, an observer XORs it against the confirmation ciphertext to recover the counter-0 keystream, then XORs that against the first data frame — disclosing its first 14 bytes. Worse, RFC 8439 derives the Poly1305 one-time key from ChaCha20 block counter 0 under the same nonce, so the reuse also exposes the authentication key and permits forgery. Differing AAD does not mitigate any of this: AAD is authenticated but neither the keystream nor the Poly1305 key depends on it. Separate `-confirm` keys remove the collision entirely.
+
+**Authenticating the learned static key.** The constructor takes `expectedPeerStaticPublicKey` as an **optional** parameter:
+- **Post-pairing** (the roster already holds the peer's key): pass it. After decoding the peer's message the handshake MUST compare the learned key against it and abort with `HandshakeError` on mismatch. This is what makes a session to a known device mutually authenticated.
+- **During pairing** (neither side yet knows the other's static key): pass `null`. Authentication comes from the pre-shared key carried in the QR invite, mixed into the HKDF salt, plus the user's SAS comparison. The static keys are learned here and written to the roster on confirmation.
+
+The earlier draft made this parameter required and had the inviting side pass *its own* public key, which would have made the two sides compute different `dh_es` values and fail to agree on a key at all.
 
 Mutual authentication holds because only the holder of `s_responder` can compute `dh_es`, and only the holder of `s_initiator` can compute `dh_se`. Forward secrecy holds because `dh_ee` requires an ephemeral private key that is discarded after the handshake.
 
@@ -576,9 +587,9 @@ Mutual authentication holds because only the holder of `s_responder` can compute
   - `class HandshakeResult { final AeadSession session; final List<int> transcript; final List<int> master; final List<int> peerStaticPublicKey; }`
   - `abstract interface class Handshake` with:
     - `Future<Uint8List> start()` — returns the local handshake message
+    - `Future<Uint8List> confirmationFor(List<int> peerMessage)`
     - `Future<HandshakeResult> complete(List<int> peerMessage, List<int> peerConfirmation)`
-    - `Future<Uint8List> confirmation()`
-  - `class OmniFiHandshakeV1 implements Handshake` with named constructors `.initiator(...)` and `.responder(...)`, each taking `{required StaticKeyPair staticKeys, required String deviceId, List<int>? peerStaticPublicKey, List<int> psk = const []}`
+  - `class OmniFiHandshakeV1 implements Handshake` with named constructors `.initiator(...)` and `.responder(...)`, each taking `{required StaticKeyPair staticKeys, required String deviceId, required List<int>? expectedPeerStaticPublicKey, List<int> psk = const []}` — the peer-key parameter is **`required` but nullable**: callers must type `null` explicitly to opt out of mutual authentication, so dropping it can never be the shortest call that compiles. A configuration with both a null expectation and an empty PSK has no authentication mechanism at all and must throw.
   - `class HandshakeError implements Exception`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1208,13 +1219,6 @@ const List<String> omnifiWordlist = [
   'float', 'flock', 'flour', 'fluid', 'flute', 'foam', 'focus', 'foggy',
   'force', 'forest', 'forge', 'forty', 'forum', 'found', 'frame', 'fresh',
 ];
-```
-
-Note: the list above is 248 entries across 31 rows of 8. Append this final row to reach exactly 256:
-
-```dart
-  // (append inside the same list literal, before the closing bracket)
-  'frost', 'fruit', 'fudge', 'fully', 'funny', 'gauge', 'ghost', 'giant',
 ```
 
 - [ ] **Step 4: Verify the wordlist length before writing the SAS code**
@@ -1987,12 +1991,26 @@ Future<DeviceIdentity> loadOrCreateIdentity({
   final existingPriv = await store.read(_kPrivateKey);
   final existingPub = await store.read(_kPublicKey);
 
-  if (existingId != null && existingPriv != null && existingPub != null) {
+  final present = [existingId, existingPriv, existingPub].where((v) => v != null).length;
+
+  // Partial state must fail loudly. Falling through to the create branch here
+  // would silently mint a NEW identity for a device that already has one --
+  // orphaning it from every peer it had paired with, with no error shown. A
+  // crash midway through first-run persistence, a partial keychain eviction,
+  // or a migration bug all produce this state.
+  if (present != 0 && present != 3) {
+    throw const IdentityError(
+        'stored identity is incomplete; refusing to regenerate and orphan '
+        'this device from its mesh. Restore the keychain entry, or delete '
+        'all of omnifi.identity.* to deliberately re-pair as a new device.');
+  }
+
+  if (present == 3) {
     final List<int> priv;
     final List<int> pub;
     try {
-      priv = base64Decode(existingPriv);
-      pub = base64Decode(existingPub);
+      priv = base64Decode(existingPriv!);
+      pub = base64Decode(existingPub!);
     } on FormatException {
       throw const IdentityError('stored key material is not valid base64');
     }
@@ -2001,7 +2019,7 @@ Future<DeviceIdentity> loadOrCreateIdentity({
     }
     await store.write(_kDisplayName, displayName);
     return DeviceIdentity(
-      deviceId: existingId,
+      deviceId: existingId!,
       displayName: displayName,
       keys: StaticKeyPair(publicKey: pub, privateKey: priv),
     );
@@ -2056,7 +2074,14 @@ git commit -m "feat: add device identity with SecureStore-backed key material"
 **Interfaces:**
 - Consumes: `randomHexId` and `SecureStore` (Task 9), `EnvelopeError` (Task 8).
 - Produces:
-  - `class PeerRecord { final String deviceId; final List<int> publicKey; final String displayName; final int addedAtMs; }` with `toMap()` / `fromMap()`.
+  - `class MeshError implements Exception {
+  const MeshError(this.reason);
+  final String reason;
+  @override
+  String toString() => 'MeshError: $reason';
+}
+
+class PeerRecord { final String deviceId; final List<int> publicKey; final String displayName; final int addedAtMs; }` with `toMap()` / `fromMap()`.
   - `class Mesh { final String meshId; List<PeerRecord> get peers; }` with:
     - `void addPeer(PeerRecord peer)` — replaces an existing record with the same device ID
     - `bool removePeer(String deviceId)` — returns whether anything was removed
@@ -2287,14 +2312,37 @@ class Mesh {
 
 Future<Mesh> loadOrCreateMesh({required SecureStore store}) async {
   final existingId = await store.read(_kMeshId);
+  final existingRoster = await store.read(_kRoster);
+
+  // All-or-nothing, in BOTH directions. The mirror case matters more than the
+  // obvious one: a roster present with no mesh ID would otherwise mint a fresh
+  // mesh ID and saveMesh() straight over the existing roster, destroying every
+  // paired device silently. That is worse than failing closed — it is data loss.
+  if ((existingId == null) != (existingRoster == null)) {
+    throw const MeshError(
+        'mesh state is incomplete: exactly one of the mesh id and the roster '
+        'is present. Refusing to continue, because creating a new mesh here '
+        'would overwrite the surviving half. Restore the missing entry, or '
+        'delete omnifi.mesh.* to deliberately start a new mesh.');
+  }
+
   if (existingId == null) {
     final mesh = Mesh(meshId: randomHexId());
     await saveMesh(mesh, store);
     return mesh;
   }
-  final roster = await store.read(_kRoster);
+  final roster = existingRoster;
   if (roster == null) {
-    return Mesh(meshId: existingId);
+    // Same all-or-nothing rule as loadOrCreateIdentity: a stored mesh ID with
+    // no roster means the two SecureStore keys diverged (partial write, storage
+    // eviction, tampering). Returning an empty roster here would make every
+    // peer unauthorized and present as "pairing mysteriously broke" rather than
+    // as an error. It fails closed, so it is not an authorization bypass — but
+    // it is undiagnosable, which is its own harm.
+    throw const MeshError(
+        'mesh id is stored but its roster is missing; refusing to continue '
+        'with an empty roster. Restore the roster entry, or delete '
+        'omnifi.mesh.* to deliberately start a new mesh.');
   }
   final decoded = jsonDecode(roster);
   if (decoded is! Map) {
@@ -2631,7 +2679,9 @@ git commit -m "feat: add Link interface with LAN-preferring quality ranking"
   - `class OutboxEntry { final Uint8List frame; final String? collapseKey; }`
   - `class Outbox` with `void add(List<int> frame, {String? collapseKey})`, `List<OutboxEntry> drain()`, `int get length`, `int get byteLength`, `int get droppedCount`, `void clear()`
 
-`collapseKey` is how stale clipboard updates are discarded: adding an entry whose key matches an existing one replaces it in place rather than queueing a second copy. Nobody wants four stale clipboards delivered on reconnect.
+`collapseKey` is how stale clipboard updates are discarded: adding an entry whose key matches an existing one **removes the old entry and appends the new one at the tail**, rather than queueing a second copy. Nobody wants four stale clipboards delivered on reconnect.
+
+**It must append, not replace in place.** An earlier draft of this plan specified position preservation, reasoning that moving the entry would let a clipboard update overtake messages queued behind it. That is backwards for counter-bearing frames: `AeadSession.seal` assigns a monotonic counter at seal time and the receiver rejects any counter that does not strictly advance — fatally. The replacement is sealed **last**, so it belongs **last**. Preserving the original slot put a later-sealed frame ahead of an earlier one, which killed the receiving session and lost the intervening frame.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2676,12 +2726,15 @@ void main() {
     expect(utf8.decode(drained.single.frame), 'fresh');
   });
 
-  test('collapse preserves the original queue position', () {
+  test('collapse moves the replacement to the tail, preserving seal order', () {
+    // NOT position-preserving. Frames carry monotonic AEAD counters assigned at
+    // seal time and the receiver rejects any counter that does not strictly
+    // advance, fatally. The replacement was sealed LAST, so it must go LAST.
     final o = Outbox();
     o.add(utf8.encode('first'), collapseKey: 'clipboard');
     o.add(utf8.encode('second'));
     o.add(utf8.encode('third'), collapseKey: 'clipboard');
-    expect(o.drain().map((e) => utf8.decode(e.frame)), ['third', 'second']);
+    expect(o.drain().map((e) => utf8.decode(e.frame)), ['second', 'third']);
   });
 
   test('entries without a key never collapse', () {
@@ -2788,22 +2841,39 @@ class Outbox {
         _entries
           ..clear()
           ..addAll(existing);
-        _enforceBounds();
+        _enforceBounds(protect: entry);
         return;
       }
     }
 
     _entries.addLast(entry);
     _byteLength += entry.frame.length;
-    _enforceBounds();
+    _enforceBounds(protect: entry);
   }
 
-  void _enforceBounds() {
+  /// Evicts oldest-first until both bounds hold, never evicting [protect].
+  ///
+  /// [protect] is the entry this call just added or collapsed into. Without
+  /// that exemption a large replacement — appended at the tail — could still be
+  /// evicted by its own insertion
+  /// while older unrelated frames survive. For a clipboard queue that inverts
+  /// the point of collapsing: the freshest content is what disappears.
+  ///
+  /// Termination is guaranteed because [add] rejects any single frame larger
+  /// than the whole byte budget, so the protected entry alone always fits.
+  void _enforceBounds({OutboxEntry? protect}) {
     while (_entries.length > maxOutboxFrames ||
         _byteLength > maxOutboxBytes) {
-      final dropped = _entries.removeFirst();
+      final victimIndex =
+          _entries.toList().indexWhere((e) => !identical(e, protect));
+      if (victimIndex < 0) break;
+      final remaining = _entries.toList()..removeAt(victimIndex);
+      final dropped = _entries.toList()[victimIndex];
       _byteLength -= dropped.frame.length;
       _droppedCount++;
+      _entries
+        ..clear()
+        ..addAll(remaining);
     }
   }
 
@@ -4219,21 +4289,21 @@ class PairingFlow {
     required String meshId,
     required bool isInitiator,
   }) async {
-    // During pairing neither side has the other's static key in the roster,
-    // so both use the inviter's advertised key as the handshake peer key and
-    // rely on the PSK for authentication. A mismatched PSK changes the
-    // master secret, which changes the SAS, which the user sees.
+    // Neither side knows the other's static key yet — that is what pairing
+    // establishes — so `expectedPeerStaticPublicKey` is null and each side
+    // LEARNS the peer's key from the handshake message. Authentication comes
+    // from the PSK in the QR invite (mixed into the HKDF salt) plus the SAS
+    // the user compares below. A mismatched PSK changes the master secret,
+    // which changes the SAS, which the user sees.
     final handshake = isInitiator
         ? OmniFiHandshakeV1.initiator(
             staticKeys: identity.keys,
             deviceId: identity.deviceId,
-            peerStaticPublicKey: invite.inviterPublicKey,
             psk: invite.psk,
           )
         : OmniFiHandshakeV1.responder(
             staticKeys: identity.keys,
             deviceId: identity.deviceId,
-            peerStaticPublicKey: invite.inviterPublicKey,
             psk: invite.psk,
           );
 
@@ -4862,7 +4932,13 @@ class ClipboardSync {
     }
     if (payload.data.length > maxClipboardBytes) return;
 
-    _lastAppliedHash = payload.contentHash;
+    // Recompute rather than trusting the peer's `contentHash`. The stored hash
+    // is what suppresses our own write echoing back through the platform
+    // watcher; if a peer sends a hash that does not match its own payload —
+    // through a bug or deliberately — the echo check never matches and the two
+    // devices ping-pong forever, which is the one failure this feature exists
+    // to prevent. Recomputing is self-validating and costs a single hash.
+    _lastAppliedHash = clipboardHash(payload.format, payload.data);
     _lastAppliedTimestampMs = payload.timestampMs;
 
     await _watcher.write(ClipboardContent(
@@ -4919,7 +4995,9 @@ git commit -m "feat: add clipboard sync with loop prevention and privacy default
   - `GET /v1/mesh/:meshId/ws?device=:deviceId` with `Upgrade: websocket` — joins the mesh.
   - Frames sent by a client are binary. The first 16 bytes are the **destination device ID** as raw bytes (32 hex chars decoded), or 16 zero bytes for broadcast. The remainder is opaque ciphertext, forwarded verbatim.
   - `GET /v1/health` → `200 {"ok":true}`.
-  - Server closes with code `1008` on a malformed mesh ID or device ID, `1009` on a frame over 1 MiB.
+  - Server returns HTTP `400` **before completing the upgrade** on a malformed mesh ID or device ID, and HTTP `426` on a non-upgrade request to the ws path. Once a socket exists, an oversized frame (over 1 MiB) closes it with code `1009`.
+
+    A close code cannot be used for a malformed ID: those are detected before the WebSocket handshake completes, so no socket exists to close. Emitting one would mean accepting the upgrade purely to close it immediately — an extra round trip and a harder error for the client to surface. `1009` is a close code because by the time a frame is read, the socket is live. Task 19's `RelayLink` must therefore treat a non-101 response as a connect failure, not as a close event.
 
 - [ ] **Step 1: Create the project files**
 
@@ -5592,7 +5670,13 @@ class RelayLink implements Link {
         (channelFactory ?? WebSocketChannel.connect)(uri);
     await channel.ready.timeout(timeout);
     return RelayLink._(
-      id: 'relay:$peerDeviceId',
+      // Host AND port, because two relay backends can be dialed for the same
+      // peer simultaneously and LinkManager keys its candidate map by id. A
+      // bare 'relay:<peer>' collides across backends; host alone still
+      // collides for two relays on one host at different ports, which is
+      // exactly the local dev setup (localhost:8787 and localhost:8788).
+      // Uri.port returns the scheme default when absent, so this stays stable.
+      id: 'relay:${relayBase.host}:${relayBase.port}:$peerDeviceId',
       channel: channel,
       peerDeviceId: peerDeviceId,
     );
@@ -6279,7 +6363,7 @@ Before any Flutter code, the composition of identity + mesh + sessions + links +
 **Interfaces:**
 - Consumes: everything from Tasks 3–20.
 - Produces:
-  - `class EngineConfig { final Uri relayBase; final String displayName; final bool lanEnabled; }`
+  - `class EngineConfig { final List<Uri> relayBases; final String displayName; final bool lanEnabled; }` — `relayBases` is every relay backend to dial, in descending preference order. All are dialed concurrently as competing candidate links.
   - `class OmniFiEngine` with:
     - `static Future<OmniFiEngine> create({required SecureStore store, required ClipboardWatcher watcher, required EngineConfig config, int Function()? clock})`
     - `DeviceIdentity get identity`, `Mesh get mesh`
@@ -6303,7 +6387,7 @@ import 'package:omnifi_core/omnifi_core.dart';
 import 'package:test/test.dart';
 
 EngineConfig config({bool lan = false}) => EngineConfig(
-      relayBase: Uri.parse('http://localhost:8787'),
+      relayBases: [Uri.parse('http://localhost:8787')],
       displayName: 'Test Device',
       lanEnabled: lan,
     );
@@ -6496,13 +6580,24 @@ import '../transport/relay_link.dart';
 
 class EngineConfig {
   const EngineConfig({
-    required this.relayBase,
+    required this.relayBases,
     required this.displayName,
     this.lanEnabled = true,
   });
-  final Uri relayBase;
+
+  /// Every relay backend to dial, in descending order of preference.
+  /// All of them are dialed concurrently and treated as competing
+  /// candidate links; whichever answers first with the lowest RTT wins.
+  /// There is no explicit failover logic because there does not need to
+  /// be — [LinkManager] already ranks candidates, and a relay that is
+  /// down simply never becomes a candidate.
+  final List<Uri> relayBases;
+
   final String displayName;
   final bool lanEnabled;
+
+  /// Convenience for the common single-relay case.
+  Uri get primaryRelay => relayBases.first;
 }
 
 /// Composition root. Everything the UI needs hangs off this one object.
@@ -6584,7 +6679,7 @@ class OmniFiEngine {
   PairingInvite buildInvite() => generateInvite(
         meshId: mesh.meshId,
         inviterPublicKey: identity.keys.publicKey,
-        relayHint: config.relayBase.toString(),
+        relayHint: config.primaryRelay.toString(),
       );
 
   Future<void> persist() => saveMesh(mesh, _store);
@@ -6625,13 +6720,18 @@ class OmniFiEngine {
     final manager = LinkManager(
       session: session,
       clock: _clock,
+      // One dialer per configured relay backend. Two relays are two
+      // candidate links, not a primary plus a failover path: LinkManager
+      // already prefers LAN over any relay, and ranks relays against each
+      // other by measured RTT. Adding a backend costs one list entry.
       dialers: [
-        () => RelayLink.connect(
-              relayBase: config.relayBase,
-              meshId: mesh.meshId,
-              localDeviceId: identity.deviceId,
-              peerDeviceId: peer.deviceId,
-            ),
+        for (final relayBase in config.relayBases)
+          () => RelayLink.connect(
+                relayBase: relayBase,
+                meshId: mesh.meshId,
+                localDeviceId: identity.deviceId,
+                peerDeviceId: peer.deviceId,
+              ),
       ],
     );
     _managers[peer.deviceId] = manager;
@@ -7591,6 +7691,30 @@ class PowerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 }
 ```
 
+- [ ] **Step 7b: Add the Swift files to the Xcode target — do not skip this**
+
+Creating a `.swift` file under `macos/Runner/` does **not** compile it. Xcode only
+builds files listed in the target's `PBXSourcesBuildPhase`, and Flutter's
+`flutter create` template does not glob the directory. Omit this and you get an app
+that builds cleanly, launches, and silently has no plugins at all — every method
+channel call fails at runtime with `MissingPluginException`, which reads like a Dart
+bug rather than a build one.
+
+Add each new `.swift` file to the `Runner` target in `macos/Runner.xcodeproj/project.pbxproj`
+(three entries per file: `PBXBuildFile`, `PBXFileReference`, and the `PBXSourcesBuildPhase`
+member list), or open the project in Xcode and add them to the target there.
+
+**Verify rather than assume.** After building, confirm the channel names are actually
+in the shipped binary:
+
+```bash
+strings build/macos/Build/Products/Debug/omnifi_app.app/Contents/MacOS/omnifi_app | grep 'com.omnifi/'
+```
+
+Expected: one line per channel. An empty result means the Swift never compiled in.
+
+The same applies verbatim to the iOS target in Task 25.
+
 - [ ] **Step 8: Register the plugins**
 
 Modify `apps/omnifi_app/macos/Runner/AppDelegate.swift` — add inside `applicationDidFinishLaunching`, or add the override if it is absent:
@@ -7651,12 +7775,19 @@ Future<void> main() async {
     store: PlatformSecureStore(),
     watcher: PlatformClipboardWatcher(),
     config: EngineConfig(
-      relayBase: Uri.parse(
-        const String.fromEnvironment(
+      // Cloudflare first, ARC second. Both are dialed; the faster one wins.
+      // A relay that is down never becomes a candidate link, so an outage
+      // on either backend is invisible to the user.
+      relayBases: [
+        Uri.parse(const String.fromEnvironment(
           'OMNIFI_RELAY',
           defaultValue: 'https://omnifi-relay.workers.dev',
-        ),
-      ),
+        )),
+        Uri.parse(const String.fromEnvironment(
+          'OMNIFI_RELAY_FALLBACK',
+          defaultValue: 'https://arc.ailuxis.com',
+        )),
+      ],
       displayName: 'OmniFi Device',
     ),
   );
@@ -8323,6 +8454,25 @@ class ClipboardPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 }
 ```
 
+> **Two corrections found by running this on a simulator (2026-07-24):**
+>
+> 1. **`window?.rootViewController as! FlutterViewController` crashes on launch.**
+>    This target is scene-based, so `window` is nil at the point `didFinishLaunching`
+>    runs and the force-unwrap traps immediately. Register in
+>    `didInitializeImplicitFlutterEngine` instead.
+> 2. **`registrar.messenger` is a *method* on iOS** (`registrar.messenger()`) and a
+>    *property* on macOS. Getting this wrong means nothing registers.
+>
+> **And the same Xcode-target trap as macOS applies here** — see Task 23's Step 7b.
+> A `.swift` file under `ios/Runner/` is not compiled unless it is a member of the
+> target's `PBXSourcesBuildPhase`; Flutter's template does not glob the directory.
+> Omit it and the app builds, launches, and silently has no plugins, failing every
+> channel call at runtime with `MissingPluginException`.
+>
+> Verify with `strings` against **`Runner.debug.dylib`**, not `Runner` — under
+> Xcode 16 debug code lives in the dylib, so grepping `Runner` returns nothing and
+> looks like the plugin never compiled in.
+
 - [ ] **Step 7: Register the iOS plugins**
 
 Modify `apps/omnifi_app/ios/Runner/AppDelegate.swift` — inside `application(_:didFinishLaunchingWithOptions:)`, before `return super.application(...)`:
@@ -8564,3 +8714,612 @@ Two consistency fixes applied inline while reviewing:
 2. `FakeLink` was promoted from `test/support/` into the library as `FakeLinkFactory` in Task 21, because the engine test and the app's tests both need it. The old path re-exports it so Tasks 11–20 tests keep compiling unchanged.
 
 **Scope check.** This plan covers exactly project 1 of the four in the spec. Projects 2–4 (iMessage, audio, video) are excluded and each need their own spec → plan cycle.
+
+---
+
+## Task 27: ARC mesh relay route (second relay backend) — DEFERRED
+
+> **Status: deferred to a later project (decided 2026-07-24).** Not built in Project 1.
+>
+> The Cloudflare relay is built, reviewed, and proven end to end — two devices with
+> independent identities genuinely paired through a live `wrangler dev`, deriving
+> matching short authentication strings. ARC would add redundancy, not capability,
+> at the cost of a second service to operate and a wire contract to keep identical
+> across two implementations.
+>
+> **Nothing needs rework to add it later.** `EngineConfig.relayBases` is already a
+> `List<Uri>` with one dialer built per entry, `RelayLink.id` already includes host
+> *and* port so two backends cannot collide in `LinkManager`'s candidate map, and
+> the client treats relays as competing candidates rather than a primary plus a
+> failover. Adding ARC is one list entry plus the Rust route below.
+>
+> The task specification below is retained verbatim so it can be picked up as-is.
+
+
+Added after the plan's first draft, when it emerged that a production Rust relay (`arc-relay`) already exists and is deployed. The decision was to run **both** backends: Cloudflare as the default, ARC as an equal-standing second candidate. `LinkManager` already races dialers and ranks by preference score, so this needs no new client failover logic — only a second entry in `EngineConfig.relayBases`.
+
+**This task's code lives in a different repository.** ARC is at `/Volumes/Main External/Development/ARC` (a Rust workspace, `arc-relay` crate, axum + sqlx). Commit there, not in the OmniFi repo. Verify the ARC checkout is clean before starting, and do not touch `mirror/`, `ws/`, `auth/`, or any existing route.
+
+**Files:**
+- Create: `arc-relay/src/mesh/mod.rs`
+- Create: `arc-relay/src/mesh/registry.rs`
+- Create: `arc-relay/src/mesh/routes.rs`
+- Create: `arc-relay/tests/mesh_relay.rs`
+- Modify: `arc-relay/src/lib.rs` (add `pub mod mesh;`)
+- Modify: `arc-relay/src/api/mod.rs` (mount the router)
+
+**Interfaces:**
+- Consumes: nothing from ARC's existing modules. Explicitly **not** `AppState`'s database pool, `auth::jwt`, `beacon_proto`, or `mirror::`.
+- Produces a network contract **byte-identical to Task 18's**:
+  - `GET /v1/mesh/:meshId/ws?device=:deviceId` with `Upgrade: websocket` → 101.
+  - Binary frames only. First 16 bytes = destination device ID as raw bytes (32 hex chars decoded), or 16 zero bytes for broadcast. Remainder is opaque and forwarded verbatim.
+  - HTTP `400` **before upgrade** on a malformed mesh ID or device ID (both must match `^[0-9a-f]{32}$`).
+  - HTTP `426` on a non-upgrade request to the ws path.
+  - Close `1009` on a frame over 1_048_576 bytes.
+  - `GET /v1/mesh/health` → `200 {"ok":true}`. (Namespaced under `/v1/mesh` to avoid colliding with ARC's existing health route.)
+
+### Design constraints — these are the point of the task
+
+**The route is deliberately unauthenticated and stateless.** It must not require a JWT, must not read or write Postgres, and must not construct a `SessionMirror`. OmniFi's design has no accounts by deliberate choice; routing through ARC's authenticated path would reverse that. The mesh ID is a 128-bit random capability and is the only credential.
+
+**It must not use `beacon_proto` envelopes.** ARC's existing fanout carries typed `ArcToClient` values. This route forwards opaque ciphertext byte-for-byte. If it ever deserializes a payload, it is wrong.
+
+**It needs the abuse protections a Durable Object gave for free.** Unlike Cloudflare, this route sits on a single public VPS with no platform-level DDoS absorption. Enforce, in `registry.rs`:
+- at most **16** concurrent sockets per mesh (reject the 17th with close `1013`),
+- at most **1024** concurrent meshes process-wide (reject with HTTP `503`),
+- a per-socket token bucket of **50 frames/second, burst 100** (exceeding it closes with `1008`),
+- a mesh entry is dropped from the registry the moment its last socket disconnects, so an idle mesh holds no memory.
+
+These numbers are generous for a personal mesh of 2–6 devices and cheap to enforce; their purpose is to bound a hostile or buggy client, not to shape normal traffic.
+
+- [ ] **Step 1: Verify the ARC checkout is clean and builds**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+git status --short
+cargo build -p arc-relay 2>&1 | tail -5
+```
+
+Expected: a clean working tree and a successful build. If the tree is dirty, STOP and report — do not commit alongside someone else's in-progress work.
+
+- [ ] **Step 2: Write the failing integration test**
+
+Create `arc-relay/tests/mesh_relay.rs`:
+
+```rust
+//! Conformance tests for the OmniFi mesh relay route.
+//!
+//! These mirror the Cloudflare Worker's test suite one-for-one. The two
+//! backends must stay contract-identical; if you change an assertion here,
+//! change it in `relay/test/mesh_do.test.ts` in the OmniFi repo too.
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+mod common;
+
+const MESH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const DEV_A: &str = "11111111111111111111111111111111";
+const DEV_B: &str = "22222222222222222222222222222222";
+
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+fn frame(dest: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + body.len());
+    out.extend_from_slice(dest);
+    out.extend_from_slice(body);
+    out
+}
+
+fn broadcast() -> Vec<u8> {
+    vec![0u8; 16]
+}
+
+#[tokio::test]
+async fn health_reports_ok() {
+    let server = common::spawn_mesh_server().await;
+    let body: serde_json::Value = reqwest::get(format!("{}/v1/mesh/health", server.http_base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body, serde_json::json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn rejects_malformed_mesh_id() {
+    let server = common::spawn_mesh_server().await;
+    let res = reqwest::get(format!(
+        "{}/v1/mesh/NOT-HEX/ws?device={DEV_A}",
+        server.http_base
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test]
+async fn rejects_malformed_device_id() {
+    let server = common::spawn_mesh_server().await;
+    let res = reqwest::get(format!(
+        "{}/v1/mesh/{MESH}/ws?device=nope",
+        server.http_base
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test]
+async fn rejects_non_upgrade_request() {
+    let server = common::spawn_mesh_server().await;
+    let res = reqwest::get(format!(
+        "{}/v1/mesh/{MESH}/ws?device={DEV_A}",
+        server.http_base
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 426);
+}
+
+#[tokio::test]
+async fn routes_directed_frame_to_addressed_device_only() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    a.send(Message::Binary(frame(&hex_to_bytes(DEV_B), b"ciphertext")))
+        .await
+        .unwrap();
+
+    let got = b.next().await.unwrap().unwrap();
+    assert_eq!(&got.into_data()[16..], b"ciphertext");
+}
+
+#[tokio::test]
+async fn broadcasts_to_every_peer_except_sender() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    a.send(Message::Binary(frame(&broadcast(), b"to everyone")))
+        .await
+        .unwrap();
+
+    let got = b.next().await.unwrap().unwrap();
+    assert_eq!(&got.into_data()[16..], b"to everyone");
+}
+
+#[tokio::test]
+async fn does_not_deliver_across_meshes() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut other = server
+        .connect("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", DEV_B)
+        .await;
+
+    a.send(Message::Binary(frame(&broadcast(), b"mesh-local")))
+        .await
+        .unwrap();
+
+    let timeout =
+        tokio::time::timeout(std::time::Duration::from_millis(200), other.next()).await;
+    assert!(timeout.is_err(), "frame leaked across meshes");
+}
+
+#[tokio::test]
+async fn drops_frame_shorter_than_header() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    a.send(Message::Binary(vec![0u8; 8])).await.unwrap();
+
+    let timeout = tokio::time::timeout(std::time::Duration::from_millis(200), b.next()).await;
+    assert!(timeout.is_err(), "short frame was forwarded");
+}
+
+#[tokio::test]
+async fn closes_on_oversized_frame() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+
+    a.send(Message::Binary(vec![0u8; 1_048_576 + 32]))
+        .await
+        .unwrap();
+
+    let closed = a.next().await;
+    match closed {
+        Some(Ok(Message::Close(Some(f)))) => assert_eq!(u16::from(f.code), 1009),
+        other => panic!("expected close 1009, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn accepts_a_frame_exactly_at_the_cap() {
+    let server = common::spawn_mesh_server().await;
+    let mut a = server.connect(MESH, DEV_A).await;
+    let mut b = server.connect(MESH, DEV_B).await;
+
+    let mut body = vec![0u8; 1_048_576 - 16];
+    body[0] = 42;
+    a.send(Message::Binary(frame(&hex_to_bytes(DEV_B), &body)))
+        .await
+        .unwrap();
+
+    let got = b.next().await.unwrap().unwrap();
+    assert_eq!(got.into_data().len(), 1_048_576);
+}
+
+#[tokio::test]
+async fn rejects_the_seventeenth_socket_in_one_mesh() {
+    let server = common::spawn_mesh_server().await;
+    let mut sockets = Vec::new();
+    for i in 0..16 {
+        sockets.push(server.connect(MESH, &format!("{:032x}", i)).await);
+    }
+    let mut overflow = server.connect(MESH, &format!("{:032x}", 99)).await;
+    match overflow.next().await {
+        Some(Ok(Message::Close(Some(f)))) => assert_eq!(u16::from(f.code), 1013),
+        other => panic!("expected close 1013, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_is_dropped_when_its_last_socket_leaves() {
+    let server = common::spawn_mesh_server().await;
+    {
+        let mut a = server.connect(MESH, DEV_A).await;
+        a.close(None).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(server.registry.mesh_count(), 0);
+}
+```
+
+- [ ] **Step 3: Write the test harness**
+
+Create `arc-relay/tests/common/mod.rs`:
+
+```rust
+//! Spawns the mesh router alone — no database, no JWT, no AppState — which
+//! is itself a check that the route has no hidden dependency on either.
+
+use arc_relay::mesh::{registry::MeshRegistry, routes::mesh_router};
+use tokio::net::TcpListener;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+pub struct TestServer {
+    pub http_base: String,
+    pub ws_base: String,
+    pub registry: MeshRegistry,
+}
+
+impl TestServer {
+    pub async fn connect(
+        &self,
+        mesh: &str,
+        device: &str,
+    ) -> WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+        let url = format!("{}/v1/mesh/{mesh}/ws?device={device}", self.ws_base);
+        let (stream, _) = connect_async(url).await.expect("ws connect failed");
+        stream
+    }
+}
+
+pub async fn spawn_mesh_server() -> TestServer {
+    let registry = MeshRegistry::new();
+    let app = mesh_router(registry.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    TestServer {
+        http_base: format!("http://{addr}"),
+        ws_base: format!("ws://{addr}"),
+        registry,
+    }
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+cargo test -p arc-relay --test mesh_relay 2>&1 | tail -20
+```
+
+Expected: compilation failure — `arc_relay::mesh` does not exist.
+
+- [ ] **Step 5: Write the registry**
+
+Create `arc-relay/src/mesh/registry.rs` implementing:
+
+```rust
+//! In-memory mesh registry for the OmniFi relay route.
+//!
+//! Deliberately has no database, no auth, and no knowledge of payload
+//! contents. A mesh is a set of connected sockets keyed by a 128-bit
+//! random mesh ID; the ID is the only credential, and the relay cannot
+//! read anything it forwards.
+```
+
+Requirements, all enforced here rather than in the route handler:
+- `MeshRegistry` is `Clone` and `Arc`-backed (follow the pattern `mirror::MirrorRegistry` uses, but share no code with it).
+- `pub fn new() -> Self`, `pub fn mesh_count(&self) -> usize`.
+- `join(mesh_id, device_id) -> Result<MeshHandle, JoinRejection>` where `JoinRejection` distinguishes `MeshFull` (→ close 1013) from `TooManyMeshes` (→ HTTP 503).
+- Each connected socket gets an `mpsc::Sender<Vec<u8>>` for outbound frames.
+- `forward(mesh_id, from_device, frame)` sends the frame verbatim to the addressed device, or to every device except the sender when the first 16 bytes are zero. It must never copy or re-encode the body.
+- Dropping the last `MeshHandle` in a mesh removes the mesh entry — implement `Drop` so this cannot be forgotten by a caller.
+- Constants: `MAX_SOCKETS_PER_MESH = 16`, `MAX_MESHES = 1024`, `MAX_FRAME_BYTES = 1_048_576`, `RATE_LIMIT_FRAMES_PER_SEC = 50`, `RATE_LIMIT_BURST = 100`.
+
+- [ ] **Step 6: Write the routes**
+
+Create `arc-relay/src/mesh/routes.rs` with `pub fn mesh_router(registry: MeshRegistry) -> axum::Router` exposing `GET /v1/mesh/health` and `GET /v1/mesh/:mesh_id/ws`.
+
+The handler must, in this order: validate the mesh ID against `^[0-9a-f]{32}$` (400 on failure), validate the `device` query parameter the same way (400), confirm the request carries a WebSocket upgrade (426 otherwise), then attempt `registry.join` (503 on `TooManyMeshes`), and only then accept the upgrade. On `MeshFull`, accept the upgrade and immediately close with 1013 — a close code is only reachable once a socket exists, which is the same reasoning that put the ID validation before the upgrade rather than after.
+
+Create `arc-relay/src/mesh/mod.rs`:
+
+```rust
+pub mod registry;
+pub mod routes;
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+cargo test -p arc-relay --test mesh_relay 2>&1 | tail -20
+```
+
+Expected: 13 passed.
+
+- [ ] **Step 8: Verify the route has no hidden dependencies**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+grep -rnE "sqlx|jwt|beacon_proto|AppState|mirror::" arc-relay/src/mesh/ && echo "FAIL: mesh route touched a forbidden module" || echo "OK: mesh route is standalone"
+```
+
+Expected: `OK: mesh route is standalone`.
+
+- [ ] **Step 9: Mount the router and confirm the whole crate still builds**
+
+Add `pub mod mesh;` to `arc-relay/src/lib.rs`, and merge `mesh_router` into the main router in `arc-relay/src/api/mod.rs` without applying any auth middleware to it.
+
+```bash
+cargo build -p arc-relay && cargo test -p arc-relay 2>&1 | tail -15
+```
+
+Expected: the build succeeds and ARC's pre-existing test suite still passes. If any pre-existing test fails, report it — do not fix unrelated failures inside this task.
+
+- [ ] **Step 10: Commit in the ARC repository**
+
+```bash
+cd "/Volumes/Main External/Development/ARC"
+git add arc-relay/src/mesh arc-relay/tests/mesh_relay.rs arc-relay/tests/common arc-relay/src/lib.rs arc-relay/src/api/mod.rs
+git commit -m "feat(mesh): add unauthenticated OmniFi mesh relay route"
+```
+
+- [ ] **Step 11: Record the deployment prerequisite**
+
+This task does **not** deploy. Note in the report that `arc.ailuxis.com` must be redeployed (per ARC's `deploy/release.sh`) before OmniFi clients can reach the ARC backend, and that until then `EngineConfig.relayBases` should list only the Cloudflare URL.
+
+---
+
+## Amendment log
+
+Changes made to this plan after its first draft, with the reason each was made.
+
+| Date | Change | Reason |
+|---|---|---|
+| 2026-07-22 | Task 18's contract changed from "close 1008 on a malformed mesh or device ID" to "HTTP 400 before upgrade" | The plan's prose contradicted its own tests. A malformed ID is caught before the WebSocket upgrade completes, so no socket exists to close. Decided by the project owner. |
+| 2026-07-22 | `RelayLink.id` changed from `relay:<peer>` to `relay:<host>:<peer>` | Two relay backends dialed for the same peer would collide in `LinkManager`'s candidate map, silently evicting one. |
+| 2026-07-22 | `EngineConfig.relayBase` → `relayBases` (a list); engine builds one dialer per entry | Second relay backend adopted (ARC). Needs no new failover logic — `LinkManager` already ranks competing candidates. |
+| 2026-07-22 | Added Task 27 (ARC mesh relay route) | A production Rust relay already exists and is deployed; running both backends gives redundancy. Decided by the project owner. |
+
+---
+
+## Task 28: Session establishment — handshake on first link adoption
+
+Added after review found that `OmniFiEngine._connectPeer` builds every `PeerSession` with **all-zero AEAD keys**, with a comment deferring to a handshake that nothing in the plan ever performs. Pairing produces a real session; nothing re-establishes one when a device reconnects. Without this, Project 1's acceptance matrix cannot pass — "survives sleep/wake" and "survives network loss" both require reconnect.
+
+**Files:**
+- Create: `packages/omnifi_core/lib/src/session/session_establisher.dart`
+- Modify: `packages/omnifi_core/lib/src/engine/omnifi_engine.dart`
+- Modify: `packages/omnifi_core/lib/omnifi_core.dart`
+- Test: `packages/omnifi_core/test/session/session_establisher_test.dart`
+
+**Interfaces:**
+- Consumes: `OmniFiHandshakeV1`, `StaticKeyPair`, `HandshakeResult`, `HandshakeError` (Task 4); `DeviceIdentity` (Task 9); `PeerRecord`, `Mesh` (Task 10); `Link`, `LinkClosedError` (Task 11); `AeadSession` (Task 3); `PeerSession` (Task 13).
+- Produces:
+  - `class SessionEstablisher` with `static Future<AeadSession> establish({required Link link, required DeviceIdentity identity, required PeerRecord peer, Duration timeout = const Duration(seconds: 10)})`
+  - `class SessionEstablishmentError implements Exception`
+  - `bool isInitiatorFor(String localDeviceId, String peerDeviceId)` — deterministic role assignment.
+
+### Design
+
+**One handshake per session, not per link.** `PeerSession` is keyed to the device pair and survives link migration without renegotiating crypto — that is the whole point of the migration design. So the handshake runs **once**, on the first link adopted for a peer, and every later link reuses the same `AeadSession`. If a session dies (a decryption failure marks it dead and forces re-handshake), the engine discards it and establishes a fresh one on the next link.
+
+**Role assignment is deterministic, not negotiated.** The device whose ID is lexicographically smaller is the initiator:
+
+```dart
+bool isInitiatorFor(String localDeviceId, String peerDeviceId) =>
+    localDeviceId.compareTo(peerDeviceId) < 0;
+```
+
+Both sides compute the same answer from data they already hold, so there is no negotiation round and no tie to break — device IDs are 128-bit random and collisions are not a practical concern. A negotiation round here would be a second place for the protocol to diverge.
+
+**Authentication is mutual and roster-bound.** Unlike pairing, both sides already know each other's static public key, so `expectedPeerStaticPublicKey` is the peer's key **from the roster** and `psk` is empty. That is what makes a reconnect to a known device mutually authenticated: a device presenting a different static key fails the handshake rather than being trusted on the strength of its device ID.
+
+**The handshake runs on the raw `Link`, before any `PeerSession` exists.** It exchanges the handshake message and the confirmation using a buffered `StreamIterator` over `link.inbound`, armed before each send — the same pattern `PairingFlow` uses, and for the same reason: `inbound` is a broadcast stream, and a frame sent while no listener is attached is dropped, producing an intermittent hang rather than a clean failure.
+
+**On failure the link is closed and not adopted.** A handshake failure means the peer is not who the roster says it is, or the link is broken. Either way the link must not become a session candidate. Close it and surface `SessionEstablishmentError`.
+
+### Engine changes
+
+- `_connectPeer` no longer constructs a `PeerSession` with zero keys. It creates the session lazily, after the first successful establishment.
+- The dialers produce a `Link`; before offering it to `LinkManager`, the engine establishes a session if it does not yet have a live one for that peer, then attaches.
+- If `session.isDead`, discard it and establish afresh on the next adopted link.
+- A failed establishment must not count as a successful dial for backoff purposes.
+
+### Tests
+
+1. Two engines with each other in their rosters establish a session over a connected link pair, and a frame sealed by one opens on the other.
+2. Role assignment is deterministic and opposite: `isInitiatorFor(a, b)` and `isInitiatorFor(b, a)` disagree, for both orderings.
+3. A peer presenting a static key that does not match its roster entry fails with `SessionEstablishmentError`, and the link is closed.
+4. Establishment does **not** re-run when a second link is adopted for a peer that already has a live session — assert the same `AeadSession` instance is reused and no second handshake occurs.
+5. A dead session is replaced: mark a session dead, adopt a new link, and assert a fresh handshake runs and a new session is installed.
+6. A link that closes mid-handshake surfaces `SessionEstablishmentError`, not a raw `LinkClosedError` or a hang.
+7. Establishment respects the timeout: a peer that never responds fails within the timeout rather than hanging.
+
+### Note on scope
+
+This does not add key rotation, session resumption, or 0-RTT. A reconnect costs one full handshake — three X25519 operations and a round trip — which is negligible against the reconnect itself.
+
+---
+
+## Task 29: Pairing rendezvous
+
+Found when the Flutter shell was built: `PairingFlow.invite` and `.join` both take a `Link`, and **nothing creates it**. Two devices that are pairing are not yet in each other's rosters, so neither the `LinkManager` dial path nor the LAN listener applies. Until this exists, pairing cannot complete end to end and nothing downstream of pairing can be tested on real hardware.
+
+**Files:**
+- Create: `packages/omnifi_core/lib/src/pairing/rendezvous.dart`
+- Modify: `packages/omnifi_core/lib/src/engine/omnifi_engine.dart`
+- Modify: `packages/omnifi_core/lib/omnifi_core.dart`
+- Test: `packages/omnifi_core/test/pairing/rendezvous_test.dart`
+- Test: extend `packages/omnifi_core/test/integration/relay_roundtrip_test.dart`
+
+### Design — meet in a derived namespace
+
+The relay treats a mesh ID as an opaque 32-hex routing key and creates a Durable Object per distinct value on demand. Nothing requires that value to be a *real* mesh. So the two pairing devices meet in a **rendezvous namespace derived from the pre-shared key already in the QR**:
+
+```
+rendezvousId = HKDF-SHA256(ikm: invite.psk, info: "omnifi-rendezvous-v1", len: 16) → 32 lowercase hex
+```
+
+Both sides connect to `/v1/mesh/<rendezvousId>/ws?device=<ephemeralId>` with a **fresh random ephemeral device ID** — not their real one.
+
+Why this shape:
+
+- **No relay change at all.** The rendezvous ID is a valid mesh ID as far as the relay is concerned.
+- **No collision with live mesh traffic.** The inviter may already hold a socket to its real mesh's DO; this is a separate DO, so nothing is demultiplexed and no device ID is duplicated on one socket set.
+- **Unguessable without the QR.** The namespace is derived from the PSK, so finding it requires the invite. That is not new exposure — the PSK is already the pairing secret, and the SAS is what defends against someone who *has* observed the QR.
+- **Costs nothing when idle.** The DO hibernates and is discarded once both sides disconnect.
+
+**Ephemeral device IDs matter.** Using real device IDs here would publish them to anyone who has seen the QR, before any authentication has happened. The ephemeral ID is used only to address relay frames during the exchange; the real identity is established by the handshake inside `PairingFlow`.
+
+### Flow
+
+1. Both sides derive `rendezvousId` from `invite.psk` and connect with their own fresh `ephemeralId`.
+2. The **joiner** broadcasts a `rendezvousHello` (16 zero bytes destination) carrying its `ephemeralId`.
+3. The **inviter**, waiting in invite mode, receives it and learns the joiner's `ephemeralId`.
+4. Each side constructs a `RelayLink` targeted at the other's `ephemeralId`.
+5. `PairingFlow.invite` / `.join` run over those links exactly as they do today — unchanged.
+6. On success or failure both rendezvous links close.
+
+**Interfaces:**
+- `String rendezvousIdFor(List<int> psk)` — deterministic, both sides derive the same value.
+- `class RendezvousError implements Exception`
+- `class PairingRendezvous` with:
+  - `static Future<Link> awaitJoiner({required PairingInvite invite, required Uri relayBase, Duration timeout = const Duration(minutes: 2)})` — inviter side.
+  - `static Future<Link> connectToInviter({required PairingInvite invite, required Uri relayBase, Duration timeout = const Duration(seconds: 30)})` — joiner side.
+- Engine: `beginInvite`/`beginJoin` gain rendezvous-creating variants so the UI does not have to build links itself.
+
+### Hazards this codebase has already been bitten by
+
+- **Arm the inbox before the first suspension.** `RelayLink.inbound` is a broadcast stream; a frame arriving with no listener attached is dropped and the symptom is an intermittent hang, not a clean failure. `SessionEstablisher` had exactly this bug latent. Subscribe *before* sending anything.
+- **The inviter's timeout is long (a user is walking to another device); the joiner's is short.** Do not use one value for both.
+- **A `RelayLink` whose peer never appears must fail, not hang.** Both timeouts must close the underlying socket.
+- **Two joiners could hit one rendezvous.** The inviter accepts the first `rendezvousHello` and ignores the rest; a second joiner fails its timeout rather than silently pairing to nothing. The SAS still protects the accepted one.
+
+### Tests
+
+1. `rendezvousIdFor` is deterministic, 32 lowercase hex, and differs for different PSKs.
+2. Two `PairingRendezvous` sides with the same invite find each other over a **live local relay** and produce links that carry frames both ways.
+3. A full pairing completes over the rendezvous: both sides derive the **same SAS**, both confirm, both end with a roster entry for the other.
+4. A joiner with the wrong PSK derives a different rendezvous ID and times out rather than pairing.
+5. The inviter times out and closes its socket when no joiner appears.
+6. A second joiner arriving after the first is ignored and times out; the first pairing still completes.
+
+Tests 2–6 need a live `wrangler dev`; tag them `integration` so a plain `dart test` skips them, and state plainly in the report if the relay could not be started.
+
+---
+
+## Amendment log — 2026-07-24
+
+| Change | Reason |
+|---|---|
+| **The iPhone is the authority, not macOS.** Relay / authority / capability-provider are now three distinct roles. | The always-on device is the phone, not a laptop that is frequently closed. See the spec amendment of the same date. |
+| **iOS reframed from "second-class peer" to "the authority, request-driven."** Task 25's framing changes; its `LifecycleBridge` work does not. | iOS cannot hold a background socket without a Network Extension. But privileged operations are human-in-the-loop by nature — Face ID requires the user to be holding the phone — so the phone never needs to act unattended. |
+| **macOS becomes an optional capability provider.** | It is the only device that can read `chat.db`. That makes it necessary *for iMessage*, not load-bearing for the product. |
+| **The relay gains an APNs key and a mesh→token map** (a later task). | Waking a backgrounded phone requires it. Content stays encrypted; the relay gains the ability to *wake* a device, never to *read* one. Recorded as a deliberate erosion of the dumb-relay principle. |
+| **Added Task 29 (pairing rendezvous).** | `PairingFlow` takes a `Link` that nothing created. Pairing could not complete end to end. |
+| **Capability responses are targeted, never broadcast.** | A live 2FA code fanned out to every device would let a compromised machine harvest codes it never requested. |
+| **Authenticator deferred to its own project.** | Needs Secure Enclave work, the APNs path, and a capability layer — none testable until a mesh can pair. |
+
+---
+
+## Task 30: macOS menu-bar agent
+
+Found at review: the spec says "macOS ships as a menu-bar agent, Windows as a tray app", and Tasks 23 and 24 both carry it in their **titles** — but no step in either implements one, so both desktop apps are ordinary windowed apps. Verified by grep: no `NSStatusItem`, no `LSUIElement`, no `Shell_NotifyIcon` anywhere. The implementers built exactly what their steps specified; the titles promised what the steps never delivered.
+
+**Scope: macOS only.** That is the platform that can be built and run here, so it can be verified rather than assumed. The Windows tray is deferred with the rest of the unverifiable Windows surface.
+
+**Files:**
+- Create: `apps/omnifi_app/macos/Runner/StatusItemPlugin.swift`
+- Create: `apps/omnifi_app/lib/platform/status_item.dart`
+- Modify: `apps/omnifi_app/macos/Runner/AppDelegate.swift`
+- Modify: `apps/omnifi_app/macos/Runner/Info.plist`
+- Modify: `apps/omnifi_app/macos/Runner.xcodeproj/project.pbxproj`
+- Modify: `apps/omnifi_app/lib/main.dart`
+- Test: `apps/omnifi_app/test/platform/status_item_test.dart`
+
+### Why this matters more than it sounds
+
+A clipboard sync tool is a background utility. As a windowed app it keeps a dock icon, appears in the app switcher, and is quit by accident by anyone tidying up — at which point sync silently stops with no indication. The menu bar is where a user checks *"is it even connected"*, which the engine already answers precisely: `status` is the **worst** peer's state, not the best, so a green icon means every device is reachable.
+
+### Design
+
+**Native `NSStatusItem` plus `NSMenu`, driven from Dart over a method channel.** Not a Flutter popover window: the menu is a status line, a pause toggle, and two commands, all of which AppKit renders better and faster than an embedded Flutter surface. The existing Flutter UI stays as a normal window opened on demand from the menu.
+
+- `LSUIElement = true` in `Info.plist` removes the dock icon and the app-switcher entry.
+- Flutter's macOS embedder shows `mainFlutterWindow` at launch. With `LSUIElement` that window must be ordered out at startup and shown only when the user asks, via `NSApp.activate(ignoringOtherApps: true)` followed by `makeKeyAndOrderFront`.
+
+**Interfaces:**
+- Channel `com.omnifi/status_item`, methods:
+  - `setStatus({status: String})` — one of `connectedDirect`, `connectedRelay`, `reconnecting`, `offline`
+  - `setPaused({paused: bool})` — reflects the check state
+  - `show()` / `hide()` — the main window
+- Event channel `com.omnifi/status_item/commands` emitting `openWindow`, `togglePause`, `quit`.
+- `class StatusItemBridge` in Dart: subscribes to `engine.statuses`, pushes state down, and routes commands back to `engine.clipboard.setPaused` and window control.
+
+**The four states must be visually distinct, not just textually.** Use SF Symbols with distinct shapes rather than colour alone — colour alone fails for a colour-blind user and is invisible in a monochrome menu bar. Suggested: `bolt.fill` (direct), `cloud.fill` (relay), `arrow.triangle.2.circlepath` (reconnecting), `bolt.slash` (offline). Set `image.isTemplate = true` so the icon follows the menu bar's light/dark appearance.
+
+### Hazards
+
+- **`quit` must stop the engine before terminating**, or the last peer sees a socket that looks alive until its liveness timeout. Call `engine.stop()` and await it before `NSApp.terminate`.
+- **The status item must be created on the main thread** and retained — an `NSStatusItem` that is not held by a strong reference disappears from the menu bar with no error.
+- **`LSUIElement` changes activation policy**, so a window shown without `NSApp.activate` appears behind other apps and looks like nothing happened.
+- **The pause toggle is two-way.** The engine can pause itself on screen lock, so the menu's check state must follow `ClipboardSync.isPaused` rather than only the user's clicks.
+- **`.swift` files must be added to the Xcode target** or they are silently never compiled — see Task 23's Step 7b. Verify with `strings` against `Runner.debug.dylib`, not `Runner`.
+
+### Tests
+
+Dart side, in `test/platform/status_item_test.dart`:
+1. Each of the four `ConnectionStatus` values maps to its own distinct wire string — a mapping that collapses two states fails.
+2. A status change on `engine.statuses` pushes exactly one `setStatus` with the right value.
+3. A `togglePause` command calls `setPaused` on the clipboard and pushes the new state back down.
+4. A `quit` command stops the engine before requesting termination.
+5. The bridge tolerates a `MissingPluginException` on a non-macOS platform without throwing — the same shape as `PowerEvents`' `Platform.isMacOS` guard.
+
+Swift side is verified by running: launch, confirm no dock icon, confirm the item appears, confirm the icon changes with status, confirm pause round-trips, confirm quit exits cleanly.
