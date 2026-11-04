@@ -564,22 +564,30 @@ class OmniFiEngine {
   /// roster: [LinkManager]'s dialers and the LAN listener both need a
   /// [PeerRecord], which is what pairing produces.
   ///
-  /// The link is closed if the pairing flow fails to start; on success the
-  /// caller owns it and closes it once [PairingSasPending.confirm] has
-  /// resolved either way. It is a rendezvous link, not a mesh link: it is
-  /// disposable, and the peer is reached on its real mesh from then on.
+  /// The engine owns the link it created here and closes it itself: if the
+  /// pairing flow fails to start, if the exchange runs past [timeout], and on
+  /// **both** outcomes of [PairingSasPending.confirm] — the success that
+  /// returns a [PairingOutcome] and the [PairingRejectedError] that does not.
+  /// The caller could not close it in any case: [PairingSasPending] exposes
+  /// only `sas` and `confirm`, and the link is not reachable through either.
+  /// It is a rendezvous link, not a mesh link: it is disposable, and the peer
+  /// is reached on its real mesh from then on.
+  ///
+  /// [timeout] bounds the whole operation and not just the rendezvous — see
+  /// [pairOverRendezvous].
   Future<PairingSasPending> beginInviteAtRendezvous(
     PairingInvite invite, {
     Uri? relayBase,
     Duration timeout = const Duration(minutes: 2),
   }) =>
-      _overRendezvous(
-        () => PairingRendezvous.awaitJoiner(
+      pairOverRendezvous(
+        meet: () => PairingRendezvous.awaitJoiner(
           invite: invite,
           relayBase: relayBase ?? config.primaryRelay,
           timeout: timeout,
         ),
-        (link) => beginInvite(invite, link),
+        run: (link) => beginInvite(invite, link),
+        timeout: timeout,
       );
 
   /// Announces this device at the rendezvous named by a scanned [invite] and
@@ -595,28 +603,95 @@ class OmniFiEngine {
     Uri? relayBase,
     Duration timeout = const Duration(seconds: 30),
   }) =>
-      _overRendezvous(
-        () => PairingRendezvous.connectToInviter(
+      pairOverRendezvous(
+        meet: () => PairingRendezvous.connectToInviter(
           invite: invite,
           relayBase: relayBase ?? config.primaryRelay,
           timeout: timeout,
         ),
-        (link) => beginJoin(invite, link),
+        run: (link) => beginJoin(invite, link),
+        timeout: timeout,
       );
 
-  Future<PairingSasPending> _overRendezvous(
-    Future<Link> Function() meet,
-    Future<PairingSasPending> Function(Link link) run,
-  ) async {
+  /// Floor on the budget left for the exchange after the rendezvous latched.
+  ///
+  /// The rendezvous phase waits for a *human* to walk to another device, which
+  /// is why its timeout is minutes; the exchange after it is four frames
+  /// between two machines and finishes in well under a second. Without a floor
+  /// a rendezvous that latched in the last instant of a two-minute wait would
+  /// be killed a few hundred milliseconds short of a pairing that was about to
+  /// succeed. The cost is that the worst case is [minExchangeTimeout] past the
+  /// caller's timeout rather than exactly at it.
+  static const Duration minExchangeTimeout = Duration(seconds: 2);
+
+  /// The shared body of [beginInviteAtRendezvous] and
+  /// [beginJoinAtRendezvous], and the seam their tests drive.
+  ///
+  /// Public only for that: [meet] and [run] are injected so the ownership
+  /// rules enforced here can be exercised without a relay, and without the
+  /// timing luck two live sockets would make the test depend on.
+  ///
+  /// Those rules are:
+  ///
+  /// * the link is closed on every failure path, including the deadline;
+  /// * the link is closed on **both** outcomes of the returned
+  ///   [PairingSasPending.confirm] — the engine created it, the engine owns
+  ///   it, and the caller has no handle with which to close it. Without this,
+  ///   every *successful* pairing leaks one WebSocket into the rendezvous
+  ///   Durable Object for its whole idle lifetime;
+  /// * [timeout] bounds the exchange as well as the rendezvous. `PairingFlow`
+  ///   has no timeout of its own and cannot get one from the transport: a
+  ///   [RelayLink] closes its inbound stream only in its own `close()`, so a
+  ///   peer whose socket dies after the rendezvous latched it produces no
+  ///   end-of-stream and the flow's link-closed branch is never reached. That
+  ///   hangs forever, and the ordinary way to reach it is a joiner whose
+  ///   process dies in the instant after the inviter latched it.
+  ///
+  /// A deadline hit here surfaces as [PairingRejectedError], not as a bare
+  /// [TimeoutException]: to everything above this line it is the same event as
+  /// any other peer that stopped answering mid-pairing.
+  Future<PairingSasPending> pairOverRendezvous({
+    required Future<Link> Function() meet,
+    required Future<PairingSasPending> Function(Link link) run,
+    required Duration timeout,
+  }) async {
+    final elapsed = Stopwatch()..start();
     final link = await meet();
+    final remaining = timeout - elapsed.elapsed;
+    final budget =
+        remaining < minExchangeTimeout ? minExchangeTimeout : remaining;
+
+    final PairingSasPending pending;
     try {
-      return await run(link);
+      pending = await run(link).timeout(budget);
+    } on TimeoutException {
+      await _closeQuietly(link);
+      throw PairingRejectedError(
+          'the peer stopped answering after the rendezvous found it: the '
+          'pairing exchange did not reach the authentication words within '
+          '$budget');
     } on Object {
       // The rendezvous link exists only to carry this exchange. A pairing that
       // never got as far as the SAS has no caller left to close it.
       await _closeQuietly(link);
       rethrow;
     }
+
+    // `confirm` is wrapped rather than returned as-is because this is the only
+    // place that still holds the link. `PairingFlow` closes it on
+    // `confirm(false)` and nowhere else: neither the `PairingOutcome` a
+    // successful `confirm(true)` returns nor the `PairingRejectedError` a
+    // failed key confirmation throws carries any way to reach it.
+    return PairingSasPending(
+      sas: pending.sas,
+      confirm: (userConfirmed) async {
+        try {
+          return await pending.confirm(userConfirmed);
+        } finally {
+          await _closeQuietly(link);
+        }
+      },
+    );
   }
 
   Future<void> forgetPeer(String deviceId) async {

@@ -301,6 +301,127 @@ void main() {
     );
   });
 
+  group('the engine owns the rendezvous link it created', () {
+    // These drive `pairOverRendezvous` directly, which is what both
+    // `beginInviteAtRendezvous` and `beginJoinAtRendezvous` are: `meet` and
+    // `run` injected, so the ownership rules can be exercised without a
+    // relay. The two-device protocol itself is covered against the live
+    // relay in test/integration.
+
+    test('a successful pairing closes the link once confirm resolves',
+        () async {
+      final inviter = await engine();
+      final joiner = await engine();
+      final invite = inviter.buildInvite();
+      final links = FakeLinkFactory.connectedPair();
+
+      final invitePending = inviter.pairOverRendezvous(
+        meet: () async => links.a,
+        run: (link) => inviter.beginInvite(invite, link),
+        timeout: const Duration(seconds: 10),
+      );
+      final joinPending = joiner.beginJoin(invite, links.b);
+      final inviterSide = await invitePending;
+      final joinerSide = await joinPending;
+      expect(inviterSide.sas, joinerSide.sas);
+
+      // The joiner goes first only because closing one end of a fake pair
+      // closes both; nothing about the fix depends on the order.
+      await joinerSide.confirm(true);
+      final outcome = await inviterSide.confirm(true);
+      expect(outcome.peer.deviceId, joiner.identity.deviceId);
+
+      expect(links.a.state, isNot(LinkState.connected),
+          reason: 'PairingSasPending exposes only sas and confirm, so the '
+              'caller has no handle to close this with. A link left open '
+              'here is one WebSocket leaked into the rendezvous Durable '
+              'Object per successful pairing, for its whole idle lifetime');
+    });
+
+    test('a pairing that fails key confirmation also closes the link',
+        () async {
+      // The other outcome of confirm(true). PairingFlow closes the link on
+      // confirm(false) and on nothing else, so this path leaks exactly as the
+      // success path does.
+      final inviter = await engine();
+      final joiner = await engine();
+      final invite = inviter.buildInvite();
+      // One bit off, as a mistyped or relayed code would be: the two sides
+      // derive different masters, so neither key confirmation can verify.
+      final tampered = PairingInvite(
+        meshId: invite.meshId,
+        inviterPublicKey: invite.inviterPublicKey,
+        psk: [...invite.psk.take(31), invite.psk[31] ^ 1],
+      );
+      final links = FakeLinkFactory.connectedPair();
+
+      final invitePending = inviter.pairOverRendezvous(
+        meet: () async => links.a,
+        run: (link) => inviter.beginInvite(invite, link),
+        timeout: const Duration(seconds: 10),
+      );
+      final joinPending = joiner.beginJoin(tampered, links.b);
+      final inviterSide = await invitePending;
+      final joinerSide = await joinPending;
+      expect(inviterSide.sas, isNot(joinerSide.sas),
+          reason: 'a wrong psk is exactly what the SAS is there to show');
+
+      await expectLater(
+          inviterSide.confirm(true), throwsA(isA<PairingRejectedError>()));
+      expect(links.a.state, isNot(LinkState.connected));
+    });
+
+    test('a flow that fails to start closes the link', () async {
+      final e = await engine();
+      final link = FakeLinkFactory(id: 'rendezvous:never-used');
+      await expectLater(
+        e.pairOverRendezvous(
+          meet: () async => link,
+          run: (_) async => throw StateError('the flow could not start'),
+          timeout: const Duration(seconds: 10),
+        ),
+        throwsA(isA<StateError>()),
+      );
+      expect(link.state, isNot(LinkState.connected),
+          reason: 'a pairing that never reached the SAS has no caller left '
+              'to close its socket');
+    });
+
+    test('a peer that dies after the latch fails the pairing instead of '
+        'hanging', () async {
+      // A link whose peer latched and then went away. It is deliberately not
+      // closed: that is what a RelayLink looks like when the remote process
+      // dies. RelayLink closes its inbound stream only in its own close(), so
+      // no end-of-stream ever arrives, PairingFlow's link-closed branch is
+      // unreachable, and PairingFlow has no timeout of its own. The ordinary
+      // route to this is a joiner whose socket dies in the instant after the
+      // inviter latched it.
+      final e = await engine();
+      final invite = e.buildInvite();
+      final link = FakeLinkFactory(id: 'rendezvous:dead-peer');
+      final elapsed = Stopwatch()..start();
+
+      await expectLater(
+        e.pairOverRendezvous(
+          meet: () async => link,
+          run: (l) => e.beginInvite(invite, l),
+          timeout: const Duration(milliseconds: 200),
+        ),
+        throwsA(isA<PairingRejectedError>()),
+        reason: 'a bare TimeoutException here is a transport detail the UI '
+            'has no case for; this is the same event as any other peer that '
+            'stopped answering',
+      ).timeout(const Duration(seconds: 30));
+      elapsed.stop();
+
+      // The floor, not the 200ms, is what governs — see minExchangeTimeout.
+      expect(elapsed.elapsed, lessThan(OmniFiEngine.minExchangeTimeout * 3),
+          reason: 'without a deadline that survives the latch this never '
+              'returns at all');
+      expect(link.state, isNot(LinkState.connected));
+    });
+  });
+
   test('forgetting a peer removes it from the roster', () async {
     final e = await engine();
     e.mesh.addPeer(PeerRecord(
