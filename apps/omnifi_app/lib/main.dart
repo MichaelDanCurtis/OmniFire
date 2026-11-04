@@ -10,6 +10,7 @@ import 'platform/clipboard_watcher_impl.dart';
 import 'platform/lifecycle.dart';
 import 'platform/power_events.dart';
 import 'platform/secure_store_impl.dart';
+import 'platform/status_item.dart';
 
 /// Where the relay lives until it is configurable at runtime.
 ///
@@ -88,6 +89,19 @@ Future<void> main() async {
   // signal to offer a foreground-only app anyway: sleep and wake are the
   // lifecycle transitions below, and there is no lock notification.
   if (Platform.isMacOS) {
+    // The menu bar is what this app *is* on macOS: `LSUIElement` takes away
+    // the dock icon and the app-switcher entry, so the status item is the only
+    // place a user can see whether OmniFi is connected, pause it, or quit it
+    // without killing the process. Held for the process lifetime, like
+    // everything else here.
+    //
+    // Started unawaited: its first act is a platform-channel call, and there
+    // is nothing below that depends on the menu bar being up to date. A
+    // missing plugin is tolerated inside the bridge — see
+    // [StatusItemBridge._invoke] — so this cannot be what stops a launch.
+    final statusItem = StatusItemBridge(engine);
+    unawaited(statusItem.start());
+
     PowerEvents().events.listen((event) {
       switch (event) {
         case 'wake':
@@ -96,8 +110,14 @@ Future<void> main() async {
           unawaited(engine.onWake());
         case 'lock':
           engine.onScreenLocked();
+          // The pause the *engine* imposed on itself. `ClipboardSync.isPaused`
+          // is the OR of a user pause and a lock pause, and only the first of
+          // those goes through the menu — a checkmark that followed clicks
+          // alone would read "syncing" straight through a locked screen.
+          unawaited(statusItem.pushPaused());
         case 'unlock':
           engine.onScreenUnlocked();
+          unawaited(statusItem.pushPaused());
         case 'sleep':
           // Nothing to do: the engine has no teardown-on-sleep, and the links
           // are already suspended by the OS by the time this arrives. It is

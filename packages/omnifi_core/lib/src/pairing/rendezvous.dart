@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:cbor/cbor.dart';
 import 'package:cryptography/cryptography.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../identity/device_identity.dart';
 import '../transport/link.dart';
@@ -109,6 +110,14 @@ _Hello? _decodeHello(List<int> frame) {
   if (role is! String) return null;
   final id = decoded['id'];
   if (id is! String || !_hexDeviceId.hasMatch(id)) return null;
+  // The all-zero id is the relay's *broadcast* address, and it is 32 lowercase
+  // hex characters, so the pattern above admits it. Latching onto it would
+  // replace "address the peer" with "fan out to the namespace" — and the very
+  // next frame this side sends is its handshake message, CBOR {v, id, e, s}
+  // carrying its real device id and real static public key. Anyone who has
+  // seen the QR could claim it and be handed both by every device present,
+  // which is precisely what the ephemeral ids exist to prevent.
+  if (id == broadcastDeviceId) return null;
   return (role: role, ephemeralId: id);
 }
 
@@ -127,6 +136,13 @@ _Hello? _decodeHello(List<int> frame) {
 /// The ephemeral id addresses relay frames for the length of the exchange and
 /// nothing else — the real identities are established inside the handshake
 /// [PairingFlow] runs over the link this returns.
+///
+/// `channelFactory` on both entry points is the same test seam
+/// [RelayLink.connect] already exposes, forwarded: it lets a suite drive both
+/// halves of the hello exchange — and the buffering, capping and fail-fast
+/// behaviour around it — deterministically, without a relay and without the
+/// timing luck a two-socket integration test depends on. Production passes
+/// nothing and gets a real WebSocket.
 class PairingRendezvous {
   const PairingRendezvous._();
 
@@ -137,6 +153,24 @@ class PairingRendezvous {
   /// can know whether it or the other got there first, so the joiner — the
   /// side that speaks first — simply keeps saying so.
   static const Duration helloInterval = Duration(milliseconds: 500);
+
+  /// Ceiling on the frames a rendezvous link will hold for a caller that is
+  /// not listening yet, in count and in total bytes.
+  ///
+  /// Both are deliberately small. A pairing exchange is four frames end to
+  /// end and only ever *two* can be in flight during the window this buffer
+  /// exists for, and each is a CBOR handshake message of a few hundred bytes;
+  /// eight frames and 256 KiB is already orders of magnitude of slack. The
+  /// window itself, however, is not small: `PairingFlow._run` cancels its
+  /// subscription when it returns its `PairingSasPending`, so from the moment
+  /// the SAS words appear until the user taps confirm there is no listener,
+  /// the socket is open, and anyone who has seen the QR can derive the
+  /// namespace and broadcast into it — up to the relay's 1 MiB frame limit,
+  /// with no rate limit. Unbounded retention across that window is a remote
+  /// memory-exhaustion vector against a phone whose only bound is how long a
+  /// human takes to read five words.
+  static const int maxPendingFrames = 8;
+  static const int maxPendingBytes = 256 * 1024;
 
   /// Ceiling on the WebSocket upgrade itself, independent of how long the
   /// caller is willing to wait for a *peer*. An inviter waits two minutes for
@@ -153,6 +187,7 @@ class PairingRendezvous {
     required Uri relayBase,
     Duration timeout = const Duration(minutes: 2),
     void Function(RelayLink socket)? debugOnSocket,
+    WebSocketChannel Function(Uri)? channelFactory,
   }) =>
       _meet(
         invite: invite,
@@ -160,6 +195,7 @@ class PairingRendezvous {
         timeout: timeout,
         isInviter: true,
         debugOnSocket: debugOnSocket,
+        channelFactory: channelFactory,
       );
 
   /// Announces this device at the rendezvous named by a scanned [invite], and
@@ -174,6 +210,7 @@ class PairingRendezvous {
     required Uri relayBase,
     Duration timeout = const Duration(seconds: 30),
     void Function(RelayLink socket)? debugOnSocket,
+    WebSocketChannel Function(Uri)? channelFactory,
   }) =>
       _meet(
         invite: invite,
@@ -181,6 +218,7 @@ class PairingRendezvous {
         timeout: timeout,
         isInviter: false,
         debugOnSocket: debugOnSocket,
+        channelFactory: channelFactory,
       );
 
   static Future<Link> _meet({
@@ -189,6 +227,7 @@ class PairingRendezvous {
     required Duration timeout,
     required bool isInviter,
     void Function(RelayLink socket)? debugOnSocket,
+    WebSocketChannel Function(Uri)? channelFactory,
   }) async {
     final rendezvousId = await rendezvousIdFor(invite.psk);
     final ephemeralId = randomHexId();
@@ -204,6 +243,7 @@ class PairingRendezvous {
         // Durable Object, which is exactly what a hello is for.
         peerDeviceId: broadcastDeviceId,
         timeout: timeout < _connectTimeout ? timeout : _connectTimeout,
+        channelFactory: channelFactory,
       );
     } on Object catch (e) {
       throw RendezvousError(
@@ -245,6 +285,17 @@ class PairingRendezvous {
 /// stream would drop anything that landed in that window. Here, one
 /// subscription is armed at construction — before a single byte is sent — and
 /// everything that is not a hello is queued until the caller listens.
+///
+/// That window is far wider than "a few microtasks", which is what makes the
+/// queue's bound load-bearing rather than tidy. `PairingFlow._run` returns its
+/// `PairingSasPending` from inside its `try`, so the `finally` cancels its
+/// subscription at that return: from the instant the SAS words go on screen
+/// until the user taps confirm there is again no listener, and the socket is
+/// still open to anyone who derived the namespace from the QR. On a bare
+/// [RelayLink] those frames are dropped, harmlessly; converting that drop into
+/// unbounded retention would make this wrapper a remote memory-exhaustion
+/// vector bounded only by human reading speed. See
+/// [PairingRendezvous.maxPendingFrames].
 class _RendezvousLink implements Link {
   _RendezvousLink({
     required RelayLink socket,
@@ -287,8 +338,19 @@ class _RendezvousLink implements Link {
   /// so anything awaiting [_settled] is ordered strictly after the write.
   String? _peerEphemeralId;
 
+  /// Frames held for a caller that has not subscribed yet, bounded by
+  /// [PairingRendezvous.maxPendingFrames] and
+  /// [PairingRendezvous.maxPendingBytes].
   final Queue<Uint8List> _pending = Queue<Uint8List>();
+  int _pendingBytes = 0;
   bool _hasListener = false;
+
+  /// Set once this link has failed and will carry nothing further. Held
+  /// rather than emitted because the window this link exists to cover is
+  /// exactly the window in which nothing is listening: an error added to a
+  /// broadcast controller with no listener is discarded, same as a frame. It
+  /// is handed to whoever subscribes next, and the stream is closed behind it.
+  RendezvousError? _failure;
 
   late final StreamController<Uint8List> _inbound =
       StreamController<Uint8List>.broadcast(
@@ -330,6 +392,7 @@ class _RendezvousLink implements Link {
     await _frames.cancel();
     await _socketStates.cancel();
     _pending.clear();
+    _pendingBytes = 0;
     if (!_inbound.isClosed) await _inbound.close();
     await _socket.close();
   }
@@ -425,7 +488,46 @@ class _RendezvousLink implements Link {
     // Pairing traffic arriving before anyone has been latched belongs to no
     // exchange this link is party to.
     if (_peerEphemeralId == null) return;
+    // Already failed: the subscription is being torn down, and anything that
+    // slips through in the meantime is not going anywhere.
+    if (_failure != null) return;
     _pending.add(frame);
+    _pendingBytes += frame.length;
+    if (_pending.length > PairingRendezvous.maxPendingFrames ||
+        _pendingBytes > PairingRendezvous.maxPendingBytes) {
+      // Failed, not trimmed. During a pairing exchange, more than a handful
+      // of frames is already anomalous — it means a bug on the peer or a
+      // hostile party in the namespace — and dropping the oldest would
+      // discard the frame the exchange actually needed while leaving the link
+      // looking healthy, which is the worst of both. Failing costs an
+      // attacker nothing they could not already get by winning the latch
+      // race, and the SAS covers that.
+      _fail(RendezvousError(
+          'the rendezvous link was flooded while the pairing was waiting on '
+          'the user: more than ${PairingRendezvous.maxPendingFrames} frames '
+          'or ${PairingRendezvous.maxPendingBytes} bytes arrived with no '
+          'reader'));
+      return;
+    }
+    _drain();
+  }
+
+  /// Ends this link, keeping [error] for whoever subscribes next.
+  void _fail(RendezvousError error) {
+    if (_failure != null) return;
+    _failure = error;
+    // Dropped: the buffer holds either a bug's output or an attacker's, and
+    // the frame this exchange needed cannot be told from the rest. Keeping it
+    // would mean the failure itself retained what it was raised about.
+    _pending.clear();
+    _pendingBytes = 0;
+    // Torn down now rather than left for the caller to notice: whatever is
+    // sending is still connected and still sending. Not awaited — this runs
+    // inside the socket's own frame callback.
+    unawaited(_frames.cancel());
+    unawaited(_socketStates.cancel());
+    unawaited(_socket.close());
+    if (!_settled.isCompleted) _settled.completeError(error);
     _drain();
   }
 
@@ -439,7 +541,13 @@ class _RendezvousLink implements Link {
   void _drain() {
     if (!_hasListener || _inbound.isClosed) return;
     while (_pending.isNotEmpty) {
-      _inbound.add(_pending.removeFirst());
+      final frame = _pending.removeFirst();
+      _pendingBytes -= frame.length;
+      _inbound.add(frame);
     }
+    final failure = _failure;
+    if (failure == null) return;
+    _inbound.addError(failure);
+    unawaited(_inbound.close());
   }
 }

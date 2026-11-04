@@ -27,6 +27,7 @@
 		0F1A2B3C0000000000000011 /* SecureStorePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F1A2B3C0000000000000001 /* SecureStorePlugin.swift */; };
 		0F1A2B3C0000000000000012 /* ClipboardPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F1A2B3C0000000000000002 /* ClipboardPlugin.swift */; };
 		0F1A2B3C0000000000000013 /* PowerPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F1A2B3C0000000000000003 /* PowerPlugin.swift */; };
+		0F1A2B3C0000000000000014 /* StatusItemPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F1A2B3C0000000000000004 /* StatusItemPlugin.swift */; };
 		33CC10F32044A3C60003C045 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 33CC10F22044A3C60003C045 /* Assets.xcassets */; };
 		33CC10F62044A3C60003C045 /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = 33CC10F42044A3C60003C045 /* MainMenu.xib */; };
 		33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CC11122044BFA00003C045 /* MainFlutterWindow.swift */; };
@@ -73,6 +74,7 @@
 		0F1A2B3C0000000000000001 /* SecureStorePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureStorePlugin.swift; sourceTree = "<group>"; };
 		0F1A2B3C0000000000000002 /* ClipboardPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardPlugin.swift; sourceTree = "<group>"; };
 		0F1A2B3C0000000000000003 /* PowerPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PowerPlugin.swift; sourceTree = "<group>"; };
+		0F1A2B3C0000000000000004 /* StatusItemPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusItemPlugin.swift; sourceTree = "<group>"; };
 		33CC10F22044A3C60003C045 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Runner/Assets.xcassets; sourceTree = "<group>"; };
 		33CC10F52044A3C60003C045 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.xib; name = Base; path = Base.lproj/MainMenu.xib; sourceTree = "<group>"; };
 		33CC10F72044A3C60003C045 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = Runner/Info.plist; sourceTree = "<group>"; };
@@ -177,6 +179,7 @@
 				0F1A2B3C0000000000000001 /* SecureStorePlugin.swift */,
 				0F1A2B3C0000000000000002 /* ClipboardPlugin.swift */,
 				0F1A2B3C0000000000000003 /* PowerPlugin.swift */,
+				0F1A2B3C0000000000000004 /* StatusItemPlugin.swift */,
 				33E51913231747F40026EE4D /* DebugProfile.entitlements */,
 				33E51914231749380026EE4D /* Release.entitlements */,
 				33CC11242044D66E0003C045 /* Resources */,
@@ -369,6 +372,7 @@
 				0F1A2B3C0000000000000011 /* SecureStorePlugin.swift in Sources */,
 				0F1A2B3C0000000000000012 /* ClipboardPlugin.swift in Sources */,
 				0F1A2B3C0000000000000013 /* PowerPlugin.swift in Sources */,
+				0F1A2B3C0000000000000014 /* StatusItemPlugin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

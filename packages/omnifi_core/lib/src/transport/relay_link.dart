@@ -202,6 +202,18 @@ class RelayLink implements Link {
     // Validated here rather than at the next send, so a malformed id fails
     // where the caller can attribute it.
     _deviceIdBytes(peerDeviceId);
+    // [broadcastDeviceId] is 32 lowercase hex characters, so the check above
+    // admits it. A link only ever moves *off* the broadcast address — at the
+    // one moment the rendezvous learns who the peer is — and never onto it:
+    // that would turn every subsequent frame, starting with a handshake
+    // message carrying this device's real id and static public key, into a
+    // fan-out to every socket in the Durable Object. Rejected here as well as
+    // in the rendezvous's own hello validation, because either check alone
+    // leaves the other route reachable.
+    if (peerDeviceId == broadcastDeviceId) {
+      throw ArgumentError.value(peerDeviceId, 'peerDeviceId',
+          'is the broadcast address; a link cannot be retargeted onto it');
+    }
     _peerDeviceId = peerDeviceId;
   }
 

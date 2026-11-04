@@ -573,5 +573,16 @@ void main() {
           broadcastAddress,
           reason: 'a rejected retarget must not half-apply');
     });
+
+    test('rejects the all-zero broadcast id', () async {
+      // broadcastDeviceId is 32 lowercase hex characters, so the hex check
+      // admits it. A link only ever moves *off* the broadcast address; being
+      // retargeted onto it means every subsequent frame — starting with a
+      // handshake message carrying this device's real id and static public
+      // key — is fanned out to every socket in the Durable Object instead of
+      // going to one peer.
+      final f = await broadcastLink();
+      expect(() => f.link.retarget(broadcastDeviceId), throwsArgumentError);
+    });
   });
 }
