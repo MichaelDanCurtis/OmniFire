@@ -39,6 +39,16 @@ dependencies:
   # (AVCaptureMetadataOutput) instead — it ships arm64 simulator slices and
   # needs no third-party binary framework. Note the simulator has no
   # camera regardless, so scanning will need a physical device to verify.
+  #
+  # It was also the app's only iOS pod. With it gone the app has no plugin
+  # carrying a podspec, so ios/ no longer uses CocoaPods at all (no Podfile,
+  # no Pods group, no "[CP] Check Pods Manifest.lock" phase) — the same shape
+  # macos/ already had. Leaving that integration in place broke every fresh
+  # clone: Flutter stops running `pod install` once no pod is required, so
+  # ios/Pods/Manifest.lock was never generated and the leftover check phase
+  # failed the build. Adding any plugin with a podspec brings CocoaPods back
+  # automatically — Flutter regenerates the Podfile and `pod install` rewrites
+  # the Xcode project — so nothing here needs restoring by hand.
 
 dev_dependencies:
   flutter_test:
